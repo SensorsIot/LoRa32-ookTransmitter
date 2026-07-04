@@ -122,14 +122,22 @@ Each codeword is transmitted several times per action (default 5×, per the RF m
 §2.3). Awning state is tracked as extended (`E`), moving (`M`), or retracted (`R`). Only
 the up/down codewords are used for motion; the auto/manual codewords (§10.1) are not.
 
-**Position tracking (open-loop, self-homing).** With no encoder, the device tracks
-position in software as **elapsed extend time (seconds)**. Extending adds the movement
-time to the position. Retracting drives the motor to the closed end-stop; the device
-commands retract for the tracked position **plus a margin** — always a little longer than
-needed — so the awning is guaranteed to reach the end-stop, then **resets position to 0**.
-Every full retract therefore re-homes and corrects drift. On boot the device performs a
-full retract (longer than the maximum extension) to reach the known-safe closed state
-(position 0). The HA "position when open" (FR-5.x) is this tracked value.
+**Position tracking (open-loop, in metres, self-homing).** With no encoder, the device
+tracks awning position in **metres** (0 = fully retracted/home … `MAX_TRAVEL_M` = fully
+extended), derived from motor run-time via a calibration factor **`SPEED_M_PER_S`**
+(metres per second): `move_time = |target − current| / SPEED_M_PER_S`.
+
+Commands carry an **absolute target position** (metres); the device moves only the
+**delta** from the current tracked position — extend if the target is greater, retract if
+less — after clamping the target to `[0, MAX_TRAVEL_M]` (no motion if equal). Example: at
+1 m, "extend to 2 m" moves +1 m.
+
+Retracting drives the motor to the closed end-stop; a move to 0 commands retract for the
+tracked distance **plus a margin** — always a little longer than needed — so the awning is
+guaranteed to reach the end-stop, then **resets position to 0**. Every full retract
+therefore re-homes and corrects the open-loop drift that accumulates while extending. On
+boot the device performs a full retract (longer than the maximum extension) to reach the
+known-safe closed state (0 m). The HA cover position (0–100 %) maps to 0…`MAX_TRAVEL_M`.
 
 ## 3. Development Phases
 
@@ -186,15 +194,16 @@ full retract (longer than the maximum extension) to reach the known-safe closed 
   **down** (extend) codewords transmitted via the existing RadioLib SX1278 OOK path
   (§2.3, FR-1.x) — not the legacy bit-banged encoding (§10.4). Each command shall be
   transmitted a configurable number of times per action (default 5).
-- **FR-4.2** [Must]: On a **down/extend** command the device shall transmit the down
-  codeword, wait a configurable **movement time**, then transmit the up codeword **once
-  as a counter-stop**, leaving the awning at a partial extension (state `E`).
+- **FR-4.2** [Must]: To reach a target further open than the current position, the device
+  shall transmit the down codeword, run for `delta / SPEED_M_PER_S`, then transmit the up
+  codeword **once as a counter-stop**, parking at the target (state `E`).
 - **FR-4.3** [Must]: On an **up/retract** command the device shall transmit the up
   codeword; the awning self-stops at its closed end-stop (state `R`). No counter-stop is
   sent.
-- **FR-4.4** [Must]: The movement time shall be configurable **in seconds** and shall
-  not be restricted to the legacy single-digit `dur × 5 s` encoding. Default 30 s (the
-  legacy `X6` value).
+- **FR-4.4** [Must]: The device shall accept an **absolute target position in metres**
+  and move only the **delta** from the current tracked position (extend if the target is
+  greater, retract if less), converting distance↔time via `SPEED_M_PER_S`. Targets shall
+  be clamped to `[0, MAX_TRAVEL_M]`; no motion if already at the target.
 - **FR-4.5** [Must]: The device shall provide an **emergency-retract command** that
   immediately performs a full retract regardless of current state (wind/storm safety).
 - **FR-4.6** [Must]: The device shall monitor a periodic **liveness heartbeat published
@@ -208,9 +217,9 @@ full retract (longer than the maximum extension) to reach the known-safe closed 
   moving (`M`), retracted (`R`).
 - **FR-4.8** [Should]: The device shall ignore a direction command that conflicts with
   the current state (e.g. extend while already extended) to avoid redundant motion.
-- **FR-4.9** [Must]: The device shall track awning position open-loop as elapsed extend
-  time. Extending shall increase the tracked position by the movement time; a full
-  retract shall reset it to **0**.
+- **FR-4.9** [Must]: The device shall track awning position **in metres** open-loop
+  (accumulated motor run-time × `SPEED_M_PER_S`). Extending increases it, retracting
+  decreases it, and a full retract resets it to **0**.
 - **FR-4.10** [Must]: Every full / emergency / boot retract shall drive the motor for the
   tracked position **plus `RETRACT_MARGIN_S`** (always longer than needed) to guarantee
   the closed end-stop and re-home the position to 0. **At boot the device shall perform
@@ -288,7 +297,8 @@ full retract (longer than the maximum extension) to reach the known-safe closed 
 | `PERIOD_MS` | 3000 | Delay between buttons in auto-cycle (test mode) |
 | `BUTTONS[]` | 4 codewords | Captured remote codes |
 | `CMD_REPEATS` | 5 | Codeword transmissions per motion action (FR-4.1) |
-| `MOVEMENT_TIME_S` | 30 | Default down extend→counter-stop delay, seconds (FR-4.4) |
+| `SPEED_M_PER_S` | calibrate | Awning speed: metres per second of motor run (FR-4.4, FR-4.9) |
+| `MAX_TRAVEL_M` | calibrate | Full extension in metres (cover 100 % / open) (FR-4.4) |
 | `EMERGENCY_TIMEOUT_S` | 120 | HA-heartbeat-loss watchdog before auto-retract (FR-4.6) |
 | `WATCHDOG_TOPIC` | `awning/watchdog` | HA automation heartbeat the watchdog monitors (FR-4.6) |
 | `RETRACT_MARGIN_S` | 5 | Extra retract time beyond tracked position to guarantee end-stop / re-home (FR-4.10) |
@@ -365,7 +375,9 @@ at bench distance and reduced TX power.
 | TC-10 | LED mirror | Observe LED during TX | LED follows carrier activity (FR-2.3) |
 | TC-11 | Timing tolerance | Compare replayed vs original pulse widths | Within receiver tolerance; original receiver actuates (NFR-1) |
 | TC-12 | Init-failure path | Set wrong `LORA_RST`; power up | Diagnostic emitted; no transmission (FR-3.1) |
-| TC-13 | Down sequence | Issue down (movement time e.g. 5 s); observe RF + awning | Down codeword sent, up codeword sent once ~5 s later; awning parks partially open; state `E` (FR-4.1, FR-4.2, FR-4.4) |
+| TC-13 | Extend to target | From 0, command extend to a target (e.g. 1 m); observe RF + awning | Down codeword sent, up counter-stop after ~(1 m / `SPEED_M_PER_S`); awning parks near 1 m; state `E` (FR-4.1, FR-4.2) |
+| TC-24 | Absolute-position delta | At 1 m, command extend to 2 m | Moves only +1 m (the delta), not a full 2 m from 0 (FR-4.4) |
+| TC-25 | Target clamp / no-op | Command a target > `MAX_TRAVEL_M`, and one equal to current | Clamped to max; no motion when already at target (FR-4.4) |
 | TC-14 | Up sequence | Issue up; observe RF + awning | Up codeword sent; awning runs to closed end-stop, no counter-stop; state `R` (FR-4.1, FR-4.3) |
 | TC-15 | Emergency retract command | Issue emergency command while extended | Immediate full retract regardless of state (FR-4.5) |
 | TC-16 | HA heartbeat watchdog | Stop the `awning/watchdog` heartbeat past `EMERGENCY_TIMEOUT_S` while still sending ordinary commands | Retract fires on heartbeat loss; ordinary commands do NOT reset the watchdog (FR-4.6) |
@@ -398,7 +410,7 @@ capture; the physical target device responds to at least one replayed button.
 | FR-4.1 | Must | TC-13, TC-14 | Covered |
 | FR-4.2 | Must | TC-13 | Covered |
 | FR-4.3 | Must | TC-14 | Covered |
-| FR-4.4 | Must | TC-13 | Covered |
+| FR-4.4 | Must | TC-24, TC-25 | Covered |
 | FR-4.5 | Must | TC-15 | Covered |
 | FR-4.6 | Should | TC-16 | Covered |
 | FR-4.7 | Should | TC-17 | Covered |
