@@ -121,6 +121,22 @@ reaches the end-stop, then **resets position to 0** (re-home). On boot the devic
 a full retract (longer than the maximum extension) to reach the known-safe closed state
 (0 m). The HA cover position (0–100 %) maps to 0…`MAX_TRAVEL_M`.
 
+### 2.6 Runtime & Connectivity Architecture
+
+The device connects to WiFi in station mode and runs MQTT, HTTP, and OTA services. A
+dedicated FreeRTOS transmit task, pinned to the application core, keys the SX1278 and runs
+the motion sequences; the WiFi/network stack runs on the other core. Command sources —
+MQTT, the HTTP page, and serial — enqueue position targets and stop/emergency requests to
+this task through a single command queue. A stop or emergency request preempts an
+in-progress move; MQTT position commands run to completion.
+
+```
+  MQTT   ┐
+  HTTP   ┼─► command queue ─► TX task (app core) ─► SX1278 DIO2 keying ─► awning
+  serial ┘                          ▲
+  WiFi / MQTT / HTTP / OTA (other core)  stop / emergency preempts
+```
+
 ## 3. Requirements
 
 ### 3.1 Functional Requirements
@@ -131,7 +147,8 @@ a full retract (longer than the maximum extension) to reach the known-safe close
 - **FR-1.2** [Must]: The device shall reconstruct each codeword's pulse train from a
   stored 18-bit value and a shared timing template (long/short pulse, gaps).
 - **FR-1.3** [Must]: The device shall hold the four remote codewords — up (`0x7f454`),
-  down (`0x7f45c`), auto (`0x7f480`), manual (`0x7f484`); motion uses up and down.
+  down (`0x7f45c`), auto (`0x7f480`), manual (`0x7f484`). Motion uses up and down; auto and
+  manual are transmitted directly from the web page (FR-8.1).
 - **FR-1.4** [Must]: The device shall transmit each codeword MSB-first, 18 bits.
 - **FR-1.5** [Should]: The device shall repeat each codeword a configurable number of
   times (default 12) with a ~15.6 ms reset gap between repetitions.
@@ -192,6 +209,50 @@ a full retract (longer than the maximum extension) to reach the known-safe close
 - **FR-5.6** [May]: The display shall blank or dim after a configurable idle period, waking
   on any state change.
 
+**Connectivity & Provisioning**
+- **FR-6.1** [Must]: The device shall join a WiFi network in station mode using credentials
+  stored in NVS.
+- **FR-6.2** [Must]: When no valid credentials exist or the join fails, the device shall
+  start a captive-portal access point (`AP_SSID`) for entering WiFi and MQTT broker
+  settings, storing them in NVS.
+- **FR-6.3** [Must]: Two resets within `DRD_WINDOW_S` shall clear stored credentials and
+  re-enter the captive portal.
+- **FR-6.4** [Should]: The device shall reconnect automatically on WiFi loss.
+
+**MQTT / Home Assistant**
+- **FR-7.1** [Must]: The device shall connect to the configured MQTT broker (plain,
+  `MQTT_PORT` 1883) with credentials from NVS, and reconnect on loss.
+- **FR-7.2** [Must]: The device shall publish Home Assistant MQTT discovery for a `cover`
+  (open = extend/down, close = retract/up, stop), an emergency-retract `button`, and
+  diagnostic `sensor`s.
+- **FR-7.3** [Must]: The cover shall accept an absolute target position; `set_position`
+  (0–100 %) maps to 0…`MAX_TRAVEL_M` (open = `MAX_TRAVEL_M`, close = 0). MQTT commands are
+  fire-and-forget and execute to completion.
+- **FR-7.4** [Must]: The device shall publish awning state as cover open/opening/closing/
+  closed, a position value when open, and an emergency/safety-retract flag.
+- **FR-7.5** [Should]: The device shall publish availability via MQTT LWT (online/offline)
+  and diagnostics: IP, WiFi RSSI, uptime, and last command with result.
+- **FR-7.6** [Must]: The device shall subscribe to the `awning/watchdog` heartbeat (FR-4.6).
+
+**HTTP Web Interface**
+- **FR-8.1** [Should]: The device shall serve a web page on the LAN (no authentication)
+  with controls: up, down, stop, emergency, a target-position input, and **auto and manual**
+  buttons that transmit the auto (`0x7f480`) and manual (`0x7f484`) codewords directly.
+- **FR-8.2** [Should]: The page shall show live awning state, position, a move
+  countdown/progress, and WiFi/MQTT status.
+- **FR-8.3** [Must]: A stop from the web page shall interrupt an in-progress move
+  immediately.
+
+**OTA**
+- **FR-9.1** [Should]: The device shall accept OTA firmware updates via ArduinoOTA over
+  WiFi (hostname `OTA_HOSTNAME`).
+
+**Command Handling**
+- **FR-10.1** [Must]: Commands from MQTT, the HTTP page, and serial shall funnel through a
+  single command queue to the dedicated transmit task (§2.6).
+- **FR-10.2** [Must]: Stop and emergency requests shall preempt an in-progress move; MQTT
+  position commands shall execute as complete sequences.
+
 ### 3.2 Non-Functional Requirements
 
 - **NFR-1** [Must]: Reproduced pulse widths shall fall within the target receiver's timing
@@ -201,6 +262,8 @@ a full retract (longer than the maximum extension) to reach the known-safe close
 - **NFR-3** [Must]: Operation shall stay within regional 433 MHz ISM power/duty-cycle
   limits.
 - **NFR-4** [May]: Firmware shall fit within the board's flash and RAM.
+- **NFR-5** [Should]: MQTT uses plain transport (port 1883) and the HTTP interface has no
+  authentication; both rely on the trusted LAN.
 
 ## 4. Risks, Assumptions & Dependencies
 
@@ -242,6 +305,12 @@ a full retract (longer than the maximum extension) to reach the known-safe close
 | `WATCHDOG_TOPIC` | `awning/watchdog` | HA automation heartbeat the watchdog monitors (FR-4.6) |
 | `RETRACT_MARGIN_S` | 5 | Extra retract time beyond tracked position to guarantee end-stop / re-home (FR-4.10) |
 | `FULL_RETRACT_S` | 40 | Boot/emergency full-close drive time (FR-4.10) |
+| `MQTT_PORT` | 1883 | MQTT broker port, plain (FR-7.1) |
+| `MQTT_BASE_TOPIC` | `awning` | Base MQTT topic (FR-7.x) |
+| `HA_DISCOVERY_PREFIX` | `homeassistant` | Home Assistant discovery prefix (FR-7.2) |
+| `AP_SSID` | `Awning-Setup` | Captive-portal AP name (FR-6.2) |
+| `DRD_WINDOW_S` | 10 | Double-reset detection window, seconds (FR-6.3) |
+| `OTA_HOSTNAME` | `awning` | ArduinoOTA hostname (FR-9.1) |
 
 ### 5.4 OLED Status Display
 
@@ -263,6 +332,29 @@ countdown to the counter-stop.
 
 - State glyphs: `^` retracted (in), `v` extended (out), animated during `MOVING`.
 - Library: U8g2, or Adafruit SSD1306 + GFX.
+
+### 5.5 MQTT / Home Assistant Interface
+- Broker: plain, `MQTT_PORT` (1883); host and credentials from NVS.
+- Discovery prefix `HA_DISCOVERY_PREFIX` (`homeassistant`); base topic `MQTT_BASE_TOPIC`
+  (`awning`).
+- Entities: `cover` (open/close/stop; `set_position` 0–100 % ↔ 0…`MAX_TRAVEL_M`),
+  emergency-retract `button`, diagnostic `sensor`s (IP, RSSI, uptime, last command), and a
+  safety-retract flag.
+- Topics: `awning/command` (targets in), `awning/status` (state out), availability (LWT),
+  `awning/watchdog` (HA heartbeat in).
+
+### 5.6 HTTP Web Interface
+- Web page on port 80, LAN, no authentication.
+- Controls: up, down, stop, emergency, target-position input, and auto/manual buttons.
+- Live status: state, position, move countdown/progress, and WiFi/MQTT indicators.
+
+### 5.7 Provisioning
+- Captive-portal AP (`AP_SSID`) when unprovisioned or on WiFi-join failure.
+- Fields: WiFi SSID/password; MQTT host/port/username/password.
+- Stored in NVS. Two resets within `DRD_WINDOW_S` clear them and re-enter the portal.
+
+### 5.8 OTA
+- ArduinoOTA over WiFi; hostname `OTA_HOSTNAME`.
 
 ## 6. Operational Procedures
 
@@ -321,6 +413,14 @@ distance and reduced TX power.
 | TC-20 | OLED state | Power up; drive up/down | OLED shows RETRACTED/MOVING/EXTENDED with glyph (FR-5.1, FR-5.2) |
 | TC-21 | OLED countdown | Extend to a target | OLED shows progress bar + countdown to counter-stop (FR-5.3) |
 | TC-22 | OLED connectivity | Observe header | Shows WiFi/MQTT indicators (FR-5.4) |
+| TC-23 | Provisioning | Boot unprovisioned; join the AP; enter WiFi + broker | Captive portal served; credentials saved; device joins WiFi (FR-6.1, FR-6.2) |
+| TC-24 | Double-reset re-provision | Reset twice within `DRD_WINDOW_S` | Credentials cleared; captive portal re-entered (FR-6.3) |
+| TC-25 | MQTT discovery + cover | Broker up; open HA; `set_position` 50 % | Cover/button/sensors appear; awning moves to ~`MAX_TRAVEL_M`/2 (FR-7.2, FR-7.3) |
+| TC-26 | MQTT state / availability | Drive moves; kill link | Cover state + position + emergency flag published; availability flips offline on loss (FR-7.4, FR-7.5) |
+| TC-27 | Web control + stop | Open page; command a move; hit stop mid-move | Move interrupts immediately (FR-8.1, FR-8.3) |
+| TC-28 | Web auto/manual + status | Press auto and manual; observe page + RF | `0x7f480` / `0x7f484` transmitted; live state/position/countdown shown (FR-8.1, FR-8.2, FR-1.3) |
+| TC-29 | OTA | Push firmware via ArduinoOTA | Device updates and reboots (FR-9.1) |
+| TC-30 | Command funnel / preempt | MQTT open, then HTTP stop | Stop preempts the MQTT move (FR-10.1, FR-10.2) |
 
 ### 7.3 Acceptance Criteria
 All **Must** FRs pass; each codeword re-decodes identically on the RTL-SDR; the awning
@@ -355,10 +455,27 @@ reaches commanded positions and fully retracts on emergency and on heartbeat los
 | FR-5.4 | Should | TC-22 | Covered |
 | FR-5.5 | May | TC-20 | Covered |
 | FR-5.6 | May | — | GAP |
+| FR-6.1 | Must | TC-23 | Covered |
+| FR-6.2 | Must | TC-23 | Covered |
+| FR-6.3 | Must | TC-24 | Covered |
+| FR-6.4 | Should | TC-26 | Covered |
+| FR-7.1 | Must | TC-25, TC-26 | Covered |
+| FR-7.2 | Must | TC-25 | Covered |
+| FR-7.3 | Must | TC-25 | Covered |
+| FR-7.4 | Must | TC-26 | Covered |
+| FR-7.5 | Should | TC-26 | Covered |
+| FR-7.6 | Must | TC-15 | Covered |
+| FR-8.1 | Should | TC-27, TC-28 | Covered |
+| FR-8.2 | Should | TC-28 | Covered |
+| FR-8.3 | Must | TC-27 | Covered |
+| FR-9.1 | Should | TC-29 | Covered |
+| FR-10.1 | Must | TC-30 | Covered |
+| FR-10.2 | Must | TC-30 | Covered |
 | NFR-1 | Must | TC-8 | Covered |
 | NFR-2 | Should | TC-2 | Covered |
 | NFR-3 | Must | Operational control (Section 6) | Procedural |
 | NFR-4 | May | Build size report | Covered |
+| NFR-5 | Should | §5.5 / §5.6 interfaces | Procedural |
 
 ## 8. Troubleshooting
 
@@ -378,8 +495,8 @@ reaches commanded positions and fully retracts on emergency and on heartbeat los
 |--------|-------------------|-----|
 | up | `0x7f454` | retract |
 | down | `0x7f45c` | extend |
-| auto | `0x7f480` | unused |
-| manual | `0x7f484` | unused |
+| auto | `0x7f480` | web-page button |
+| manual | `0x7f484` | web-page button |
 
 ### 9.2 Toolchain
 - PlatformIO (`espressif32`), Arduino, RadioLib; U8g2 (or Adafruit SSD1306 + GFX).
