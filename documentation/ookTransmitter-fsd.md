@@ -281,6 +281,47 @@ capture; the physical target device responds to at least one replayed button.
 - `README.md` — quick-start and capture workflow.
 - `documentation/ookTransmitter-fsd.md` — this document.
 
+### 10.4 Legacy Awning Control (Node-RED, disabled)
+
+The 433.92 MHz remote replayed by this device is an **awning** controller. A prior,
+now-**disabled** Node-RED flow named **"Awning"** (tab `e1c2ca1342eeb2fd`, in
+`flows.json` on the IOTstack hub `192.168.0.203`) drove the awning over MQTT before
+this device existed. It is captured here as background for the intended MQTT/auto
+behaviour of the new firmware.
+
+**Control model:** the flow published short codes to MQTT topics `awning/command`
+and `curtain/command`. The letter is direction, the trailing number is a
+sequence/parameter:
+
+- **`X#` = eXtend** (awning out — corresponds to **down**)
+- **`R#` = Retract** (awning in — corresponds to **up**)
+
+| Origin | Code | Meaning |
+|--------|------|---------|
+| Telegram `e` (manual) | `X6` | extend |
+| Telegram `r` (manual) | `R7` | retract |
+| Auto "Commander" | `X7` | extend |
+| Auto "Commander" | `R9` | retract / emergency |
+
+Distinct codes observed across the flows: `X1, X6, X7, R7, R9`.
+
+**Auto logic ("Commander" function):** driven by global vars `wind`,
+`SolarIntensity` (Lux), `temp`:
+- Extend when `Lux ≥ 3.0` **and** `temp ≥ 20 °C` **and** `wind ≤ 20`.
+- Retract when `Lux < 1.0` **or** `temp < 18 °C`.
+- **Emergency retract when `wind > 25`.**
+- Minimum 10 minutes between movements.
+
+The flow also had a Telegram bot for manual `e`/`r` control and status messages, and
+a `Store Command` node tracking a `commandSent` flag (`X6`→1, `R7`→0).
+
+**Open items (not resolvable from the flow):** the meaning of the numeric suffix
+(repeat count / hold duration / step) and the mapping from `X#`/`R#` codes to the
+physical remote buttons (up/down/auto/manual — see §10.1) lived in the **old awning
+device firmware** that consumed `awning/command`, not in Node-RED. These must be
+recovered from that firmware (or from operator knowledge) before the up/down
+**sequence** can be reproduced by this device.
+
 ## 11. Related
 
 - [[Embedded-Workbench-FSD]] — the workbench that hosts the RTL-SDR receiver and
