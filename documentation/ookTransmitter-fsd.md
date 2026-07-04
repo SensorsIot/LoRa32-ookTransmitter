@@ -122,6 +122,15 @@ Each codeword is transmitted several times per action (default 5×, per the RF m
 §2.3). Awning state is tracked as extended (`E`), moving (`M`), or retracted (`R`). Only
 the up/down codewords are used for motion; the auto/manual codewords (§10.1) are not.
 
+**Position tracking (open-loop, self-homing).** With no encoder, the device tracks
+position in software as **elapsed extend time (seconds)**. Extending adds the movement
+time to the position. Retracting drives the motor to the closed end-stop; the device
+commands retract for the tracked position **plus a margin** — always a little longer than
+needed — so the awning is guaranteed to reach the end-stop, then **resets position to 0**.
+Every full retract therefore re-homes and corrects drift. On boot the device performs a
+full retract (longer than the maximum extension) to reach the known-safe closed state
+(position 0). The HA "position when open" (FR-5.x) is this tracked value.
+
 ## 3. Development Phases
 
 ### Phase 1 — Board & Radio Foundation
@@ -199,6 +208,14 @@ the up/down codewords are used for motion; the auto/manual codewords (§10.1) ar
   moving (`M`), retracted (`R`).
 - **FR-4.8** [Should]: The device shall ignore a direction command that conflicts with
   the current state (e.g. extend while already extended) to avoid redundant motion.
+- **FR-4.9** [Must]: The device shall track awning position open-loop as elapsed extend
+  time. Extending shall increase the tracked position by the movement time; a full
+  retract shall reset it to **0**.
+- **FR-4.10** [Must]: Every full / emergency / boot retract shall drive the motor for the
+  tracked position **plus `RETRACT_MARGIN_S`** (always longer than needed) to guarantee
+  the closed end-stop and re-home the position to 0. **At boot the device shall perform
+  this full retract** to reach the known-safe closed state (`FULL_RETRACT_S`, longer than
+  the maximum extension, when the position is unknown).
 
 **Initialization & Diagnostics**
 - **FR-3.1** [Must]: The device shall initialize the SX1278 in FSK/OOK mode and, on
@@ -274,6 +291,8 @@ the up/down codewords are used for motion; the auto/manual codewords (§10.1) ar
 | `MOVEMENT_TIME_S` | 30 | Default down extend→counter-stop delay, seconds (FR-4.4) |
 | `EMERGENCY_TIMEOUT_S` | 120 | HA-heartbeat-loss watchdog before auto-retract (FR-4.6) |
 | `WATCHDOG_TOPIC` | `awning/watchdog` | HA automation heartbeat the watchdog monitors (FR-4.6) |
+| `RETRACT_MARGIN_S` | 5 | Extra retract time beyond tracked position to guarantee end-stop / re-home (FR-4.10) |
+| `FULL_RETRACT_S` | 40 | Boot/emergency full-close drive time when position unknown (> max extend) (FR-4.10) |
 
 ### 6.4 OLED Status Display
 
@@ -355,6 +374,8 @@ at bench distance and reduced TX power.
 | TC-19 | OLED state display | Power up; drive up/down | OLED shows RETRACTED/MOVING/EXTENDED with direction glyph (FR-5.1, FR-5.2) |
 | TC-20 | OLED down countdown | Issue down (e.g. 20 s) | OLED shows progress bar + countdown to counter-stop (FR-5.3) |
 | TC-21 | OLED connectivity | Observe header with WiFi/MQTT off | Shows offline indicators; updates when WiFi/MQTT present (FR-5.4) |
+| TC-22 | Position tracking / re-home | Extend 20 s, then retract; read reported position | Position rises while open; retract overshoots and resets to 0 at closed (FR-4.9, FR-4.10) |
+| TC-23 | Boot homing | Power up with the awning partly open | Device performs a full retract to closed, position 0 (FR-4.10) |
 
 ### 8.3 Acceptance Criteria
 All **Must** FRs pass; each replayed codeword re-decodes identically to its original
@@ -382,6 +403,8 @@ capture; the physical target device responds to at least one replayed button.
 | FR-4.6 | Should | TC-16 | Covered |
 | FR-4.7 | Should | TC-17 | Covered |
 | FR-4.8 | Should | TC-18 | Covered |
+| FR-4.9 | Must | TC-22 | Covered |
+| FR-4.10 | Must | TC-22, TC-23 | Covered |
 | FR-5.1 | Should | TC-19 | Covered |
 | FR-5.2 | Should | TC-19 | Covered |
 | FR-5.3 | Should | TC-20 | Covered |
