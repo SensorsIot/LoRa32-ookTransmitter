@@ -1,4 +1,4 @@
-# LoRa32 OOK Awning Controller
+# 🎚️ LoRa32 OOK Awning Controller
 
 A smart-home controller for a 433.92 MHz remote-controlled awning (Storen), built on a
 TTGO LoRa32 (SX1278) board. It drives the awning by transmitting the original remote's
@@ -6,22 +6,22 @@ TTGO LoRa32 (SX1278) board. It drives the awning by transmitting the original re
 Home Assistant over MQTT, to a phone via a LAN web page, and to the OLED — with a
 fail-closed wind-safety watchdog.
 
-## What it does
+## ✨ What it does
 
-- **Positions the awning** to an absolute target in metres. Extending runs the motor and
+- 📏 **Positions the awning** to an absolute target in metres. Extending runs the motor and
   sends a counter-stop to park at the target; retracting runs to the closed end-stop and
   re-homes the position to 0.
-- **Home Assistant integration** via MQTT auto-discovery: the awning appears as a `cover`
+- 🏠 **Home Assistant integration** via MQTT auto-discovery: the awning appears as a `cover`
   (open / close / stop / set-position), plus an emergency-retract button and diagnostic
   sensors.
-- **Local web page** on the LAN with up / down / stop / emergency controls, a
+- 📱 **Local web page** on the LAN with up / down / stop / emergency controls, a
   target-position input, live state and progress, and the auto / manual remote buttons.
-- **Fail-closed safety.** Home Assistant is the wind-safety authority: it publishes a
+- 🛡️ **Fail-closed safety.** Home Assistant is the wind-safety authority: it publishes a
   liveness heartbeat, and if the heartbeat stops or signals an unsafe condition, the
   device fully retracts on its own.
-- **OLED status**, captive-portal WiFi/MQTT provisioning, and OTA firmware updates.
+- 🖥️ **OLED status**, captive-portal WiFi/MQTT provisioning, and OTA firmware updates.
 
-## How it works
+## ⚙️ How it works
 
 ```
   Home Assistant ─MQTT─┐
@@ -41,7 +41,7 @@ The radio side is unchanged from a plain OOK replay: the SX1278 runs in continuo
 mode and the carrier is keyed by driving `DIO2` (GPIO32) from the MCU, reconstructing each
 codeword from a shared timing template.
 
-## Remote codes
+## 📡 Remote codes
 
 A 4-button 433.92 MHz remote, captured with `rtl_433 -A` on the workbench RTL-SDR. Each
 button is an 18-bit fixed OOK-PWM codeword:
@@ -56,9 +56,9 @@ button is an 18-bit fixed OOK-PWM codeword:
 Timing template: bit `0` = long pulse ~2150 µs, bit `1` = short pulse ~416 µs; each bit is
 one pulse + gap, and a word ends with a ~15.6 ms reset gap.
 
-## Setup
+## 🚀 Setup
 
-### 1. Build & flash
+### 1. 🔨 Build & flash
 
 ```bash
 pio run                 # build
@@ -70,27 +70,27 @@ Flash through the Universal Embedded Workbench (RFC2217) by overriding the uploa
 see the commented example in `platformio.ini`. After the first USB flash, subsequent
 updates can go over WiFi (ArduinoOTA, hostname `awning`).
 
-### 2. Provision WiFi + MQTT
+### 2. 📶 Provision WiFi + MQTT
 
 On first boot (or after a double reset within 10 s) the device starts a captive-portal
 access point **`Awning-Setup`**. Join it and enter the WiFi credentials and the MQTT
 broker host / port / user / password; they are stored in NVS.
 
-### 3. Calibrate
+### 3. 📐 Calibrate
 
 Measure a real run and set the two constants in `src/config.h`:
 
 - `SPEED_M_PER_S` — metres of awning travel per second of motor run.
 - `MAX_TRAVEL_M` — full extension in metres (maps to Home Assistant's 100 % position).
 
-### 4. Home Assistant
+### 4. 🏠 Home Assistant
 
 The awning appears automatically via MQTT discovery. The site's wind/lux/temperature
 automation and the required `awning/watchdog` heartbeat are provided in
 [`homeassistant/awning.yaml`](homeassistant/awning.yaml). The device only allows the
 awning to stay open while that automation is alive.
 
-## Board wiring (TTGO LoRa32 T3 v1.6.1, SX1278)
+## 🔌 Board wiring (TTGO LoRa32 T3 v1.6.1, SX1278)
 
 | SX1278 | ESP32 GPIO | Role |
 |--------|-----------|------|
@@ -107,7 +107,7 @@ OLED (SSD1306): SDA 21, SCL 22, reset GPIO 16. Onboard LED (GPIO 25) mirrors the
 If `beginFSK` fails, the `RST` pin is the usual culprit; if the radio initializes but no
 RF is emitted, `DIO2` is not reaching GPIO32.
 
-## Adding or recapturing a code
+## 🎛️ Adding or recapturing a code
 
 ```bash
 rtl_433 -A -f 433.92M       # on the workbench Pi; trigger the button
@@ -117,14 +117,14 @@ rtl_433 -A -f 433.92M       # on the workbench Pi; trigger the button
 value in `BUTTONS[]` in `src/config.cpp`; if the timing differs, adjust the template
 constants in `src/config.h`.
 
-## Notes
+## ⚠️ Notes
 
 - **RTL-SDR overload**: transmitting at close range into the RTL-SDR can saturate it. Keep
   `TX_POWER` low, add distance, or attenuate.
 - **433.92 MHz is licensed spectrum.** Operate within legal power / duty-cycle limits for
   your region.
 
-## Documentation
+## 📚 Documentation
 
 - [`documentation/ookTransmitter-fsd.md`](documentation/ookTransmitter-fsd.md) — full
   functional specification.
