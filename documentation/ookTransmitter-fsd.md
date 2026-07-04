@@ -51,10 +51,11 @@ board bring-up. Out of scope: signal capture/decoding (performed externally by
 
 ### 2.1 Components
 
-- **MCU / Radio**: TTGO LoRa32 v2.1 — ESP32 + Semtech SX1278 sub-GHz transceiver.
+- **MCU / Radio**: TTGO LoRa32 T3 v1.6.1 — ESP32 + Semtech SX1278 sub-GHz transceiver.
+- **Display**: onboard SSD1306 128×64 OLED (I2C) for status.
 - **Firmware**: PlatformIO / Arduino framework using the RadioLib library.
 - **Capture toolchain (external)**: RTL-SDR + `rtl_433` on the workbench Raspberry Pi.
-- **Host/operator interface**: USB serial (CH9102) at 115200 baud.
+- **Host/operator interface**: USB serial (CH9102) at 115200 baud + the OLED.
 
 ### 2.2 Architecture Summary
 
@@ -85,8 +86,10 @@ On trigger, it reconstructs the pulse train bit-by-bit and keys the SX1278 carri
 | MISO | 19 | | RST | 23 (v2.1) / 14 (v1.0) |
 | MOSI | 27 | | DIO0 | 26 |
 | — | — | | DIO1 | 33 |
+| — | — | | **DIO2** | **32 — OOK keying** |
 
-Onboard LED on GPIO 25 mirrors carrier state.
+OLED (SSD1306, I2C): SDA 21, SCL 22 (some T3 revisions also need OLED reset on GPIO 16,
+driven high at init). Onboard LED on GPIO 25 mirrors carrier state.
 
 ### 2.5 Awning Motion Model
 
@@ -196,6 +199,20 @@ the up/down codewords are used for motion; the auto/manual codewords (§10.1) ar
 > **Note:** the hands-free auto-cycle of FR-2.1 is a bring-up/test behaviour only; it
 > must not run in awning-control operation, where motion occurs solely on command.
 
+**Status Display (OLED)**
+- **FR-5.1** [Should]: The device shall drive the onboard SSD1306 128×64 OLED (I2C,
+  SDA 21 / SCL 22) to present operating status.
+- **FR-5.2** [Should]: The display shall show the awning state prominently — `RETRACTED`,
+  `MOVING`, or `EXTENDED` — with a direction indicator (§6.4).
+- **FR-5.3** [Should]: During a **down** movement the display shall show a countdown /
+  progress bar of the remaining movement time until the counter-stop (FR-4.2).
+- **FR-5.4** [Should]: The display shall show connectivity status — WiFi (SSID/IP, or
+  AP-provisioning) and MQTT (connected/disconnected). *(Populated once the WiFi/MQTT
+  features are added; shows "offline" until then.)*
+- **FR-5.5** [May]: The display shall show the last command and its result.
+- **FR-5.6** [May]: The display shall blank or dim after a configurable idle period to
+  limit OLED burn-in, waking on any state change.
+
 ### 4.2 Non-Functional Requirements
 
 - **NFR-1** [Must]: Reproduced pulse widths shall fall within the target receiver's
@@ -243,6 +260,28 @@ the up/down codewords are used for motion; the auto/manual codewords (§10.1) ar
 | `CMD_REPEATS` | 5 | Codeword transmissions per motion action (FR-4.1) |
 | `MOVEMENT_TIME_S` | 30 | Default down extend→counter-stop delay, seconds (FR-4.4) |
 | `EMERGENCY_TIMEOUT_S` | 120 | No-command watchdog before auto-retract (FR-4.6) |
+
+### 6.4 OLED Status Display
+
+128×64 SSD1306 over I2C (SDA 21 / SCL 22). A clean status screen: a header with the
+device name and connectivity indicators, a large centred awning state with a direction
+arrow, and a footer with the last command / IP. During a **down** movement the state
+area shows a progress bar and countdown to the counter-stop.
+
+```
+ Idle / at rest                     During a down movement
+ +----------------------+          +----------------------+
+ | Awning      wifi mqtt |          | Awning      wifi mqtt |
+ |                      |          |  EXTENDING           |
+ |   ^   RETRACTED      |          |  [########----] 18s  |
+ |                      |          |  stop in 18 s        |
+ | down 30s   192.168.. |          | 192.168.0.x          |
+ +----------------------+          +----------------------+
+```
+
+- State glyphs: `^` retracted (in), `v` extended (out), animated during `MOVING`.
+- Connectivity indicators reflect WiFi and MQTT once those features exist (§4.1 FR-5.4).
+- Recommended library: U8g2 (nice fonts) or Adafruit SSD1306 + GFX.
 
 ## 7. Operational Procedures
 
@@ -299,6 +338,9 @@ at bench distance and reduced TX power.
 | TC-16 | Emergency watchdog | Send no command past the watchdog timeout | Automatic full retract occurs (FR-4.6) |
 | TC-17 | State reporting | Drive up/down; read reported state | State transitions E → M → R / R → M → E reported (FR-4.7) |
 | TC-18 | Conflicting command ignored | Issue down while already extended | Command ignored; no motion (FR-4.8) |
+| TC-19 | OLED state display | Power up; drive up/down | OLED shows RETRACTED/MOVING/EXTENDED with direction glyph (FR-5.1, FR-5.2) |
+| TC-20 | OLED down countdown | Issue down (e.g. 20 s) | OLED shows progress bar + countdown to counter-stop (FR-5.3) |
+| TC-21 | OLED connectivity | Observe header with WiFi/MQTT off | Shows offline indicators; updates when WiFi/MQTT present (FR-5.4) |
 
 ### 8.3 Acceptance Criteria
 All **Must** FRs pass; each replayed codeword re-decodes identically to its original
@@ -326,6 +368,12 @@ capture; the physical target device responds to at least one replayed button.
 | FR-4.6 | Should | TC-16 | Covered |
 | FR-4.7 | Should | TC-17 | Covered |
 | FR-4.8 | Should | TC-18 | Covered |
+| FR-5.1 | Should | TC-19 | Covered |
+| FR-5.2 | Should | TC-19 | Covered |
+| FR-5.3 | Should | TC-20 | Covered |
+| FR-5.4 | Should | TC-21 | Covered |
+| FR-5.5 | May | TC-19 | Covered |
+| FR-5.6 | May | — | GAP |
 | NFR-1 | Must | TC-11 | Covered |
 | NFR-2 | Should | TC-2 (bench setup) | Covered |
 | NFR-3 | Must | Operational control (Section 7) | Procedural |
@@ -353,6 +401,7 @@ capture; the physical target device responds to at least one replayed button.
 
 ### 10.2 Toolchain
 - PlatformIO (`espressif32`), Arduino framework, RadioLib.
+- Display: U8g2 (or Adafruit SSD1306 + GFX) for the onboard OLED.
 - Board: `ttgo-lora32-v21`.
 - Capture: `rtl_433` v25.02 on the workbench RTL-SDR (RTL2838, R820T tuner).
 
