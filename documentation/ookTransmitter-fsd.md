@@ -1,569 +1,413 @@
-# Functional Specification — LoRa32 OOK Transmitter
+# Functional Specification — LoRa32 OOK Awning Controller
 
 ## 1. System Overview
 
 ### 1.1 Purpose
 
-The LoRa32 OOK Transmitter is a single-board firmware that reproduces ("replays")
-433.92 MHz on-off-keyed (OOK) remote-control signals. Signals are first captured
-from an original remote using an RTL-SDR receiver and `rtl_433`; the resulting
-fixed codewords are stored in firmware and re-emitted on demand by a TTGO LoRa32
-(SX1278) board. It is the transmit half of a capture-and-replay workflow, paired
-with the RTL-SDR receiver on the Universal Embedded Workbench.
-
-Its application is an **awning (Storen) controller**: it reproduces the awning
-remote's **up** (retract) and **down** (extend) 433.92 MHz commands and implements
-the awning's motion model, in which the motor runs in one direction until a
-*counter-command* halts it. The two directions are therefore **asymmetric** — **down**
-is a timed sequence (extend → wait → counter-stop, parking at a partial extension)
-while **up** runs to the closed mechanical end-stop and self-stops. A safety
-**emergency retract** (on demand and on a no-command watchdog) closes the awning fully.
-This behaviour is specified in §2.5 and §4.1; its derivation from the legacy control
-system is recorded in §10.4.
+The device is an awning (Storen) controller on a TTGO LoRa32 (SX1278) board. It drives
+the awning by transmitting the awning remote's **up** (retract) and **down** (extend)
+433.92 MHz OOK commands, and implements the awning's motion model: the motor runs in one
+direction until a *counter-command* halts it. The two directions are asymmetric — **down**
+extends and is stopped by a counter-command to park at a chosen position, while **up**
+runs to the closed mechanical end-stop and self-stops. A safety **emergency retract**
+closes the awning fully. Wind safety is delegated to Home Assistant; the device fails
+closed if HA's liveness heartbeat stops.
 
 ### 1.2 Goals
 
-- Faithfully replay captured fixed-code OOK-PWM remote signals on 433.92 MHz via
-  RadioLib (SX1278 DIO2 keying) — the legacy bit-banged encoding is not used.
-- Control the awning: extend to a timed partial position (**down**), retract to the
-  closed end-stop (**up**), and retract immediately on an emergency command.
-- Use only the up/down codewords for motion; auto/manual are captured but unused.
-- Remain reproducible and version-controlled so new remotes can be added easily.
+- Position the awning by absolute target in metres, transmitting the up/down codewords
+  via RadioLib (SX1278 DIO2 keying).
+- Control and monitor over Home Assistant (MQTT), a local web page, and the OLED.
+- Fail safe (fully retracted) on loss of the Home Assistant automation.
 
 ### 1.3 Scope
 
-In scope: RF generation of pre-captured fixed OOK-PWM codewords, serial control,
-board bring-up. Out of scope: signal capture/decoding (performed externally by
-`rtl_433`), rolling-code cracking, two-way RF, and any receive capability.
+In scope: awning position control, RF generation of the fixed OOK codewords, MQTT/HTTP
+control, OLED status, and the safety watchdog. Out of scope: signal capture/decoding
+(done externally with `rtl_433`), two-way RF, and any receive capability.
 
 ### 1.4 Definitions
 
 | Term | Meaning |
 |------|---------|
-| OOK | On-Off Keying — carrier is switched fully on/off to encode data |
-| PWM | Pulse-Width Modulation — bit value encoded by pulse duration |
-| Codeword | The 18-bit fixed payload of one button press |
-| Mark / Space | Carrier-on interval / carrier-off interval |
-| Reset gap | Long inter-word gap that delimits repeated codewords |
-| DUT | Device Under Test (here, the LoRa32 board on the workbench) |
+| OOK | On-Off Keying — carrier switched fully on/off to encode data |
+| Codeword | The 18-bit fixed payload of one remote button |
+| Extend / Retract | Awning moving out (down) / in (up) |
+| Counter-stop | Opposite command sent once to halt a moving awning at a partial position |
+| Position | Awning extension in metres, 0 = fully retracted |
+| Re-home | Full retract that drives past the end-stop and resets position to 0 |
 
 ## 2. System Architecture
 
 ### 2.1 Components
 
 - **MCU / Radio**: TTGO LoRa32 T3 v1.6.1 — ESP32 + Semtech SX1278 sub-GHz transceiver.
-- **Display**: onboard SSD1306 128×64 OLED (I2C) for status.
-- **Firmware**: PlatformIO / Arduino framework using the RadioLib library.
-- **Capture toolchain (external)**: RTL-SDR + `rtl_433` on the workbench Raspberry Pi.
-- **Host/operator interface**: USB serial (CH9102) at 115200 baud + the OLED.
-- **Wind-safety controller (external)**: Home Assistant — using the site weather-station
-  wind sensor — runs the awning automation and publishes the liveness heartbeat the
-  device watches (§4.1 FR-4.6). The device has **no local wind sensor**; wind safety is
-  delegated to HA, with the heartbeat watchdog as the fail-safe.
+- **Display**: onboard SSD1306 128×64 OLED (I2C).
+- **Firmware**: PlatformIO / Arduino, RadioLib.
+- **Wind-safety controller (external)**: Home Assistant, using the site weather-station
+  wind sensor, runs the awning automation and publishes the liveness heartbeat the device
+  watches (FR-4.6). The device has no local wind sensor.
+- **Interfaces**: MQTT (Home Assistant), a local HTTP page, USB serial (CH9102, 115200),
+  and the OLED.
 
 ### 2.2 Architecture Summary
 
 ```
-  Original remote ──RF──► RTL-SDR + rtl_433 ──► codeword + timing (offline capture)
-                                                        │
-                                                        ▼  stored in BUTTONS[] / template
-  Serial / auto-cycle ──► SX1278 OOK keying ──RF──► replayed 433.92 MHz codeword
+  Command (MQTT / HTTP / serial) ─► motion state machine ─► SX1278 OOK keying ─RF─► awning
+                                          ▲
+  HA awning/watchdog heartbeat ───────────┘  (fail-safe retract on loss)
 ```
 
-The firmware holds each button's codeword and a shared OOK-PWM timing template.
-On trigger, it reconstructs the pulse train bit-by-bit and keys the SX1278 carrier.
+The firmware holds the up/down codewords and their timing template, reconstructs the
+pulse train, and keys the SX1278 carrier via DIO2.
 
 ### 2.3 Signal Model
 
-- Modulation: OOK, pulse-width coded. Bit `0` = long pulse (~2150 µs); bit `1` =
-  short pulse (~416 µs). Each bit is one pulse followed by a gap.
+- Modulation: OOK, pulse-width coded. Bit `0` = long pulse (~2150 µs); bit `1` = short
+  pulse (~416 µs). Each bit is one pulse followed by a gap.
 - Codeword length: 18 bits, transmitted MSB-first.
-- Word repetition: each codeword is repeated (default 12×); a ~15.6 ms reset gap
-  separates repetitions.
-- Codewords are **fixed** (not rolling), which is what makes replay valid.
+- Word repetition: each codeword is repeated (default 12×); a ~15.6 ms reset gap separates
+  repetitions. Each motion action sends its codeword `CMD_REPEATS` times (default 5).
+- Codewords are fixed (not rolling).
 
 ### 2.4 Pin Mapping (SX1278 ↔ ESP32)
 
 | SX1278 | GPIO | | SX1278 | GPIO |
 |--------|------|-|--------|------|
 | SCK | 5 | | NSS | 18 |
-| MISO | 19 | | RST | 23 (v2.1) / 14 (v1.0) |
+| MISO | 19 | | RST | 23 |
 | MOSI | 27 | | DIO0 | 26 |
 | — | — | | DIO1 | 33 |
 | — | — | | **DIO2** | **32 — OOK keying** |
 
-OLED (SSD1306, I2C): SDA 21, SCL 22 (some T3 revisions also need OLED reset on GPIO 16,
-driven high at init). Onboard LED on GPIO 25 mirrors carrier state.
+OLED (SSD1306, I2C): SDA 21, SCL 22, reset GPIO 16. Onboard LED on GPIO 25 mirrors
+carrier state.
 
 ### 2.5 Awning Motion Model
 
-The device drives the awning by transmitting the **up** (retract) and **down**
-(extend) codewords through the same RadioLib SX1278 OOK path as any other codeword
-(§2.3); the motion behaviour is layered on top as a small state machine. The awning
-motor runs continuously in one direction until a *counter-command* stops it, so the two
-directions are asymmetric:
+The device drives the awning by transmitting the up and down codewords through the
+RadioLib SX1278 OOK path (§2.3); a state machine layers the motion behaviour on top. The
+motor runs in one direction until a counter-command stops it, so the two directions are
+asymmetric:
 
 ```
-  waiting ──(down cmd)──► extending ──(after movement time)──► send UP once (counter-stop) ──► waiting (state E)
-  waiting ──(up cmd)────► retracting ─(runs to closed end-stop)─────────────────────────────► waiting (state R)
-  any state ─(emergency)─► retracting (full close)
+  waiting ─(extend to target)─► extending ─(delta reached)─► send UP once (counter-stop) ─► waiting (E)
+  waiting ─(retract to 0)─────► retracting ─(runs to end-stop, re-home)──────────────────► waiting (R)
+  any state ─(emergency)──────► retracting (full close, re-home)
 ```
 
-- **Down / extend:** transmit the **down** codeword → wait a configurable **movement
-  time** (seconds) → transmit the **up** codeword *once* as a counter-stop. The awning
-  parks at the partial extension reached during that time.
-- **Up / retract:** transmit the **up** codeword; the awning runs to its closed
-  mechanical end-stop and self-stops. No counter-stop.
-- **Emergency retract:** a full retract, regardless of state — triggered on demand, on
-  loss of the Home Assistant automation heartbeat, or on an explicit unsafe heartbeat
-  (§4.1 FR-4.6). Retracted is the safe state, so the device fails closed.
+- **Down / extend:** transmit the down codeword, run for the delta time, then transmit the
+  up codeword once as a counter-stop. The awning parks at the target.
+- **Up / retract:** transmit the up codeword; the awning runs to its closed end-stop and
+  self-stops.
+- **Emergency retract:** a full retract regardless of state — on demand, on loss of the
+  Home Assistant heartbeat, or on an unsafe heartbeat (FR-4.6). Retracted is the safe
+  state; the device fails closed.
 
-Each codeword is transmitted several times per action (default 5×, per the RF model in
-§2.3). Awning state is tracked as extended (`E`), moving (`M`), or retracted (`R`). Only
-the up/down codewords are used for motion; the auto/manual codewords (§10.1) are not.
+Awning state is tracked as extended (`E`), moving (`M`), or retracted (`R`).
 
 **Position tracking (open-loop, in metres, self-homing).** With no encoder, the device
-tracks awning position in **metres** (0 = fully retracted/home … `MAX_TRAVEL_M` = fully
-extended), derived from motor run-time via a calibration factor **`SPEED_M_PER_S`**
-(metres per second): `move_time = |target − current| / SPEED_M_PER_S`.
+tracks position in **metres** (0 = fully retracted … `MAX_TRAVEL_M` = fully extended),
+derived from motor run-time via **`SPEED_M_PER_S`** (metres per second):
+`move_time = |target − current| / SPEED_M_PER_S`.
 
 Commands carry an **absolute target position** (metres); the device moves only the
-**delta** from the current tracked position — extend if the target is greater, retract if
-less — after clamping the target to `[0, MAX_TRAVEL_M]` (no motion if equal). Example: at
-1 m, "extend to 2 m" moves +1 m.
+**delta** from the current position — extend if the target is greater, retract if less —
+after clamping the target to `[0, MAX_TRAVEL_M]` (no motion if equal). At 1 m, a target of
+2 m moves +1 m.
 
-Retracting drives the motor to the closed end-stop; a move to 0 commands retract for the
-tracked distance **plus a margin** — always a little longer than needed — so the awning is
-guaranteed to reach the end-stop, then **resets position to 0**. Every full retract
-therefore re-homes and corrects the open-loop drift that accumulates while extending. On
-boot the device performs a full retract (longer than the maximum extension) to reach the
-known-safe closed state (0 m). The HA cover position (0–100 %) maps to 0…`MAX_TRAVEL_M`.
+A move to 0 commands retract for the tracked distance **plus a margin**, so the awning
+reaches the end-stop, then **resets position to 0** (re-home). On boot the device performs
+a full retract (longer than the maximum extension) to reach the known-safe closed state
+(0 m). The HA cover position (0–100 %) maps to 0…`MAX_TRAVEL_M`.
 
-## 3. Development Phases
+## 3. Requirements
 
-### Phase 1 — Board & Radio Foundation
-- **Scope**: Board bring-up, SPI init, SX1278 initialization in FSK/OOK mode,
-  carrier on/off keying primitive.
-- **Deliverables**: Firmware that initializes the radio at 433.92 MHz and can key
-  the carrier; serial status output.
-- **Exit criteria**: `beginFSK` returns success; carrier presence observable on an
-  SDR; init failure halts with a diagnostic.
-- **Dependencies**: RadioLib, correct board variant / RST pin.
-
-### Phase 2 — Codeword Replay
-- **Scope**: Codeword table (`BUTTONS[]`), timing template, pulse-train
-  reconstruction, word repetition, hands-free auto-cycle, serial trigger.
-- **Deliverables**: All four captured buttons replay correctly; serial `u/d/a/m`
-  triggers; auto-cycle mode.
-- **Exit criteria**: An RTL-SDR running `rtl_433` re-decodes each replayed codeword
-  identically to the original capture.
-- **Dependencies**: Phase 1; captured codewords.
-
-### Phase 3 — Timing Precision & Extensibility (optional)
-- **Scope**: Microsecond-accurate keying via SX1278 DIO2 direct data mode;
-  additional remotes/protocols; adjustable TX power/attenuation.
-- **Deliverables**: DIO2-based keying path; documented process for adding remotes.
-- **Exit criteria**: Short intervals (<200 µs) reproduced within receiver tolerance.
-- **Dependencies**: Phase 2; DIO2 availability on the board variant.
-
-## 4. Requirements
-
-### 4.1 Functional Requirements
+### 3.1 Functional Requirements
 
 **RF Generation**
-- **FR-1.1** [Must]: The device shall transmit on 433.92 MHz using OOK modulation
-  via the SX1278.
+- **FR-1.1** [Must]: The device shall transmit on 433.92 MHz using OOK modulation via the
+  SX1278.
 - **FR-1.2** [Must]: The device shall reconstruct each codeword's pulse train from a
   stored 18-bit value and a shared timing template (long/short pulse, gaps).
-- **FR-1.3** [Must]: The device shall support the four captured buttons — up
-  (`0x7f454`), down (`0x7f45c`), auto (`0x7f480`), manual (`0x7f484`).
+- **FR-1.3** [Must]: The device shall hold the four remote codewords — up (`0x7f454`),
+  down (`0x7f45c`), auto (`0x7f480`), manual (`0x7f484`); motion uses up and down.
 - **FR-1.4** [Must]: The device shall transmit each codeword MSB-first, 18 bits.
 - **FR-1.5** [Should]: The device shall repeat each codeword a configurable number of
   times (default 12) with a ~15.6 ms reset gap between repetitions.
 
 **Control & Operation**
-- **FR-2.1** [Must]: The device shall auto-cycle through all buttons, transmitting
-  each in turn with a configurable inter-button delay (default 3 s), when no serial
-  command is pending.
-- **FR-2.2** [Should]: The device shall transmit a specific button on receipt of the
-  matching serial key: `u`, `d`, `a`, `m`.
-- **FR-2.3** [May]: The device shall mirror carrier state on the onboard LED.
-
-**Awning Motion Control**
-- **FR-4.1** [Must]: The device shall drive the awning using the **up** (retract) and
-  **down** (extend) codewords transmitted via the existing RadioLib SX1278 OOK path
-  (§2.3, FR-1.x) — not the legacy bit-banged encoding (§10.4). Each command shall be
-  transmitted a configurable number of times per action (default 5).
-- **FR-4.2** [Must]: To reach a target further open than the current position, the device
-  shall transmit the down codeword, run for `delta / SPEED_M_PER_S`, then transmit the up
-  codeword **once as a counter-stop**, parking at the target (state `E`).
-- **FR-4.3** [Must]: On an **up/retract** command the device shall transmit the up
-  codeword; the awning self-stops at its closed end-stop (state `R`). No counter-stop is
-  sent.
-- **FR-4.4** [Must]: The device shall accept an **absolute target position in metres**
-  and move only the **delta** from the current tracked position (extend if the target is
-  greater, retract if less), converting distance↔time via `SPEED_M_PER_S`. Targets shall
-  be clamped to `[0, MAX_TRAVEL_M]`; no motion if already at the target.
-- **FR-4.5** [Must]: The device shall provide an **emergency-retract command** that
-  immediately performs a full retract regardless of current state (wind/storm safety).
-- **FR-4.6** [Must]: The device shall monitor a periodic **liveness heartbeat published
-  by the Home Assistant awning automation** (topic `awning/watchdog`, ~30 s interval).
-  If no heartbeat arrives within `EMERGENCY_TIMEOUT_S` (default 120 s), **or** a
-  heartbeat explicitly signals an unsafe condition, the device shall perform an
-  emergency retract (fail-safe: HA / automation / link presumed down). **Ordinary
-  command traffic shall not reset the watchdog — only the heartbeat**, so the timer
-  proves the wind-safety automation itself is alive, not merely that the broker is up.
-- **FR-4.7** [Should]: The device shall track and report awning state — extended (`E`),
-  moving (`M`), retracted (`R`).
-- **FR-4.8** [Should]: The device shall ignore a direction command that conflicts with
-  the current state (e.g. extend while already extended) to avoid redundant motion.
-- **FR-4.9** [Must]: The device shall track awning position **in metres** open-loop
-  (accumulated motor run-time × `SPEED_M_PER_S`). Extending increases it, retracting
-  decreases it, and a full retract resets it to **0**.
-- **FR-4.10** [Must]: Every full / emergency / boot retract shall drive the motor for the
-  tracked position **plus `RETRACT_MARGIN_S`** (always longer than needed) to guarantee
-  the closed end-stop and re-home the position to 0. **At boot the device shall perform
-  this full retract** to reach the known-safe closed state (`FULL_RETRACT_S`, longer than
-  the maximum extension, when the position is unknown).
+- **FR-2.1** [Should]: The device shall accept a command on receipt of the matching serial
+  key: `u` (up), `d` (down), `a`, `m`.
+- **FR-2.2** [May]: The device shall mirror carrier state on the onboard LED.
 
 **Initialization & Diagnostics**
 - **FR-3.1** [Must]: The device shall initialize the SX1278 in FSK/OOK mode and, on
-  initialization failure, halt further transmission and emit a diagnostic message.
-- **FR-3.2** [Should]: The device shall log readiness and each transmission (button
-  name and code) over serial at 115200 baud.
+  initialization failure, halt transmission and emit a diagnostic message.
+- **FR-3.2** [Should]: The device shall log readiness and each transmission over serial at
+  115200 baud.
 
-> **Note:** the hands-free auto-cycle of FR-2.1 is a bring-up/test behaviour only; it
-> must not run in awning-control operation, where motion occurs solely on command.
+**Awning Motion Control**
+- **FR-4.1** [Must]: The device shall drive the awning using the up (retract) and down
+  (extend) codewords via the RadioLib SX1278 OOK path (§2.3, FR-1.x), transmitted
+  `CMD_REPEATS` times per action (default 5).
+- **FR-4.2** [Must]: To reach a target further open than the current position, the device
+  shall transmit the down codeword, run for `delta / SPEED_M_PER_S`, then transmit the up
+  codeword once as a counter-stop, parking at the target (state `E`).
+- **FR-4.3** [Must]: On a retract command the device shall transmit the up codeword; the
+  awning self-stops at its closed end-stop (state `R`).
+- **FR-4.4** [Must]: The device shall accept an **absolute target position in metres** and
+  move only the **delta** from the current position (extend if greater, retract if less),
+  converting distance↔time via `SPEED_M_PER_S`. Targets are clamped to `[0, MAX_TRAVEL_M]`;
+  no motion if already at the target.
+- **FR-4.5** [Must]: The device shall provide an emergency-retract command that immediately
+  performs a full retract regardless of current state.
+- **FR-4.6** [Must]: The device shall monitor the Home Assistant automation heartbeat
+  (topic `awning/watchdog`, ~30 s interval). If no heartbeat arrives within
+  `EMERGENCY_TIMEOUT_S` (default 120 s), or a heartbeat signals an unsafe condition, the
+  device shall emergency-retract. Only the heartbeat resets the watchdog — ordinary command
+  traffic does not — so the timer proves the wind-safety automation is alive.
+- **FR-4.7** [Should]: The device shall track and report awning state — extended (`E`),
+  moving (`M`), retracted (`R`).
+- **FR-4.8** [Should]: The device shall ignore a command that matches the current position
+  (no redundant motion).
+- **FR-4.9** [Must]: The device shall track awning position in metres open-loop
+  (accumulated motor run-time × `SPEED_M_PER_S`). Extending increases it, retracting
+  decreases it, and a full retract resets it to 0.
+- **FR-4.10** [Must]: Every full / emergency / boot retract shall drive the motor for the
+  tracked position plus `RETRACT_MARGIN_S` to guarantee the closed end-stop and re-home the
+  position to 0. At boot the device shall perform a full retract (`FULL_RETRACT_S`) to reach
+  the known-safe closed state.
 
 **Status Display (OLED)**
 - **FR-5.1** [Should]: The device shall drive the onboard SSD1306 128×64 OLED (I2C,
   SDA 21 / SCL 22) to present operating status.
 - **FR-5.2** [Should]: The display shall show the awning state prominently — `RETRACTED`,
-  `MOVING`, or `EXTENDED` — with a direction indicator (§6.4).
-- **FR-5.3** [Should]: During a **down** movement the display shall show a countdown /
-  progress bar of the remaining movement time until the counter-stop (FR-4.2).
+  `MOVING`, or `EXTENDED` — with a direction indicator (§5.4).
+- **FR-5.3** [Should]: During a down movement the display shall show a progress bar and
+  countdown to the counter-stop (FR-4.2).
 - **FR-5.4** [Should]: The display shall show connectivity status — WiFi (SSID/IP, or
-  AP-provisioning) and MQTT (connected/disconnected). *(Populated once the WiFi/MQTT
-  features are added; shows "offline" until then.)*
+  AP-provisioning) and MQTT (connected/disconnected).
 - **FR-5.5** [May]: The display shall show the last command and its result.
-- **FR-5.6** [May]: The display shall blank or dim after a configurable idle period to
-  limit OLED burn-in, waking on any state change.
+- **FR-5.6** [May]: The display shall blank or dim after a configurable idle period, waking
+  on any state change.
 
-### 4.2 Non-Functional Requirements
+### 3.2 Non-Functional Requirements
 
-- **NFR-1** [Must]: Reproduced pulse widths shall fall within the target receiver's
-  timing tolerance (~±690 µs observed) so that the original receiver accepts them.
-- **NFR-2** [Should]: Default TX power shall be modest to avoid overloading a
-  nearby RTL-SDR during bench verification.
-- **NFR-3** [Must]: Operation shall be limited to signals the operator is authorized
-  to transmit, within regional 433 MHz ISM power/duty-cycle limits.
-- **NFR-4** [May]: Firmware shall fit comfortably within board resources (baseline:
-  ~23% flash, ~7% RAM).
+- **NFR-1** [Must]: Reproduced pulse widths shall fall within the target receiver's timing
+  tolerance (~±690 µs) so the awning receiver accepts them.
+- **NFR-2** [Should]: TX power shall be modest to avoid overloading a nearby RTL-SDR during
+  bench checks.
+- **NFR-3** [Must]: Operation shall stay within regional 433 MHz ISM power/duty-cycle
+  limits.
+- **NFR-4** [May]: Firmware shall fit within the board's flash and RAM.
 
-## 5. Risks, Assumptions & Dependencies
+## 4. Risks, Assumptions & Dependencies
 
 | ID | Type | Description | Mitigation |
 |----|------|-------------|------------|
-| R-1 | Risk | Carrier keyed via SPI mode switches (`transmitDirect`/`standby`) has latency; short intervals (172 µs) may be distorted. | Large receiver tolerance absorbs it; Phase 3 DIO2 direct keying for precision. |
-| R-2 | Risk | Board variant RST pin differs (23 on v2.1, 14 on v1.0); wrong pin → init failure. | Documented `LORA_RST` define; diagnostic on `beginFSK` failure. |
-| R-3 | Risk | Transmitting at close range overloads the RTL-SDR receiver. | Low TX power, physical distance, or attenuation (NFR-2). |
-| A-1 | Assumption | Target remote uses fixed (non-rolling) codes. | Verified: identical codeword across all presses. |
-| A-2 | Assumption | All four buttons share one timing template. | Verified: identical timing across captures. |
+| R-1 | Risk | Wrong `LORA_RST` for the board prevents radio init. | `LORA_RST` set to 23; diagnostic on `beginFSK` failure. |
+| R-2 | Risk | Transmitting at close range overloads a nearby RTL-SDR. | Low TX power, distance, or attenuation (NFR-2). |
+| R-3 | Risk | Open-loop position drifts while extending. | Every full retract re-homes to 0 (FR-4.10). |
+| R-4 | Risk | A fast gust while HA is alive but slow to react leaves the awning exposed; no local sensor can beat HA's reaction. | Conservative wind threshold and prompt retract in the HA automation. |
+| A-1 | Assumption | The awning remote uses fixed (non-rolling) codes. | — |
+| A-2 | Assumption | Wind data exists only in Home Assistant; the device delegates wind safety to HA. | Heartbeat watchdog retracts on HA/automation/link loss (FR-4.6). |
 | D-1 | Dependency | RadioLib SX127x driver (OOK direct mode). | Pinned in `platformio.ini`. |
-| D-2 | Dependency | External capture via `rtl_433` for any new remote. | Documented workflow. |
-| A-3 | Assumption | Wind data exists only in Home Assistant (weather station); the device has no local wind sensor and delegates wind safety to HA. | Heartbeat watchdog retracts on HA/automation/link loss (FR-4.6). |
-| R-4 | Risk | A fast gust while HA is alive but slow to react leaves the awning exposed — no local sensor can beat HA's reaction time. | Conservative wind threshold + prompt retract in the HA automation; accept as a documented limitation. |
-| D-3 | Dependency | Home Assistant awning automation publishing the `awning/watchdog` heartbeat. | Specified in §4.1 FR-4.6. |
+| D-2 | Dependency | Home Assistant awning automation publishing `awning/watchdog`. | FR-4.6, §9.4. |
 
-## 6. Interfaces
+## 5. Interfaces
 
-### 6.1 RF Interface
+### 5.1 RF Interface
 - Frequency: 433.92 MHz. Modulation: OOK, PWM-coded.
-- Timing template: long pulse ≈2150 µs / space ≈172 µs; short pulse ≈416 µs /
-  space ≈1908 µs; inter-word reset ≈15.6 ms.
+- Timing template: long pulse ≈2150 µs / space ≈172 µs; short pulse ≈416 µs / space
+  ≈1908 µs; inter-word reset ≈15.6 ms.
 - Payload: 18-bit fixed codeword, MSB-first.
 
-### 6.2 Serial Interface
+### 5.2 Serial Interface
 - 115200 baud, 8N1, USB CDC (CH9102).
-- Input commands (single character): `u` = up, `d` = down, `a` = auto, `m` = manual.
-- Output: readiness banner and per-transmission log lines `TX <name> (0x<code>)`.
+- Input keys: `u` = up, `d` = down, `a`, `m`.
+- Output: readiness banner and per-transmission log lines.
 
-### 6.3 Configuration Constants (firmware)
+### 5.3 Configuration Constants (firmware)
 | Constant | Default | Meaning |
 |----------|---------|---------|
 | `FREQ_MHZ` | 433.92 | Carrier frequency |
 | `TX_POWER` | 10 dBm | SX1278 output power |
 | `REPEATS` | 12 | Word repetitions per transmission |
-| `PERIOD_MS` | 3000 | Delay between buttons in auto-cycle (test mode) |
-| `BUTTONS[]` | 4 codewords | Captured remote codes |
+| `BUTTONS[]` | 4 codewords | Remote codes |
 | `CMD_REPEATS` | 5 | Codeword transmissions per motion action (FR-4.1) |
 | `SPEED_M_PER_S` | calibrate | Awning speed: metres per second of motor run (FR-4.4, FR-4.9) |
 | `MAX_TRAVEL_M` | calibrate | Full extension in metres (cover 100 % / open) (FR-4.4) |
-| `EMERGENCY_TIMEOUT_S` | 120 | HA-heartbeat-loss watchdog before auto-retract (FR-4.6) |
+| `EMERGENCY_TIMEOUT_S` | 120 | Heartbeat-loss watchdog before auto-retract (FR-4.6) |
 | `WATCHDOG_TOPIC` | `awning/watchdog` | HA automation heartbeat the watchdog monitors (FR-4.6) |
 | `RETRACT_MARGIN_S` | 5 | Extra retract time beyond tracked position to guarantee end-stop / re-home (FR-4.10) |
-| `FULL_RETRACT_S` | 40 | Boot/emergency full-close drive time when position unknown (> max extend) (FR-4.10) |
+| `FULL_RETRACT_S` | 40 | Boot/emergency full-close drive time (FR-4.10) |
 
-### 6.4 OLED Status Display
+### 5.4 OLED Status Display
 
-128×64 SSD1306 over I2C (SDA 21 / SCL 22). A clean status screen: a header with the
-device name and connectivity indicators, a large centred awning state with a direction
-arrow, and a footer with the last command / IP. During a **down** movement the state
-area shows a progress bar and countdown to the counter-stop.
+128×64 SSD1306 over I2C (SDA 21 / SCL 22): a header with device name and connectivity
+indicators, a large centred awning state with a direction arrow, and a footer with the
+last command and IP. During a down movement the state area shows a progress bar and
+countdown to the counter-stop.
 
 ```
  Idle / at rest                     During a down movement
  +----------------------+          +----------------------+
  | Awning      wifi mqtt |          | Awning      wifi mqtt |
  |                      |          |  EXTENDING           |
- |   ^   RETRACTED      |          |  [########----] 18s  |
- |                      |          |  stop in 18 s        |
- | down 30s   192.168.. |          | 192.168.0.x          |
+ |   ^   RETRACTED      |          |  [########----] 1.5m |
+ |                      |          |  stop at 1.5 m       |
+ | 192.168.0.x          |          | 192.168.0.x          |
  +----------------------+          +----------------------+
 ```
 
 - State glyphs: `^` retracted (in), `v` extended (out), animated during `MOVING`.
-- Connectivity indicators reflect WiFi and MQTT once those features exist (§4.1 FR-5.4).
-- Recommended library: U8g2 (nice fonts) or Adafruit SSD1306 + GFX.
+- Library: U8g2, or Adafruit SSD1306 + GFX.
 
-## 7. Operational Procedures
+## 6. Operational Procedures
 
-### 7.1 Build & Flash
+### 6.1 Build & Flash
 - Build: `pio run`.
 - Flash (local USB): `pio run -t upload`.
-- Flash (workbench RFC2217): `pio run -t upload --upload-port
-  'rfc2217://<host>:<port>'`. If the board does not enter download mode via
-  DTR/RTS auto-reset, force download mode (hold GPIO0 low during reset) — see
-  Section 9.
+- Flash (workbench RFC2217): `pio run -t upload --upload-port 'rfc2217://<host>:<port>'`.
+  If the board does not enter download mode over RFC2217, flash locally via the workbench
+  `POST /api/flash`.
 
-### 7.2 Normal Operation
-- On power-up the firmware initializes the radio and prints a readiness banner.
-- With no serial input, it auto-cycles all four buttons.
-- Sending `u`/`d`/`a`/`m` transmits the corresponding button immediately.
+### 6.2 Normal Operation
+- On power-up the firmware initializes the radio and performs a full retract to the
+  known-safe closed state (position 0).
+- The device positions the awning on command from Home Assistant (MQTT), the web page, or
+  serial.
 
-### 7.3 Adding a New Remote / Button
+### 6.3 Adding / Recapturing a Remote Code
 1. Capture on the RTL-SDR: `rtl_433 -A -f 433.92M`, trigger the button.
-2. Record the decoded `{18}` codeword; confirm it is identical across presses.
-3. Add `{ "name", 0x<code> }` to `BUTTONS[]`. Adjust the timing template constants
-   only if the new remote's pulse widths differ.
-4. Rebuild, flash, and verify (Section 8).
+2. Read the decoded `{18}` codeword.
+3. Set the value in `BUTTONS[]`; adjust the timing template if the pulse widths differ.
+4. Rebuild, flash, and verify (Section 7).
 
-### 7.4 Recovery
-- Radio init failure: check board variant `LORA_RST` and wiring; re-flash.
-- No RF observed: verify frequency, antenna, and TX power; confirm SX1278 (433 MHz
-  variant, not 868/915).
+### 6.4 Recovery
+- Radio init failure: check `LORA_RST` and wiring; re-flash.
+- No RF: check frequency, antenna, and TX power; confirm the 433 MHz SX1278.
 
-## 8. Verification & Validation
+## 7. Verification & Validation
 
-### 8.1 Test Environment
-Workbench RTL-SDR running `rtl_433 -f 433.92M` (or `-A`), LoRa32 DUT with antenna
-at bench distance and reduced TX power.
+### 7.1 Test Environment
+Workbench RTL-SDR running `rtl_433 -f 433.92M` (or `-A`), LoRa32 with antenna at bench
+distance and reduced TX power.
 
-### 8.2 Functional Tests
+### 7.2 Functional Tests
 
 | ID | Objective | Steps | Expected Result |
 |----|-----------|-------|-----------------|
-| TC-1 | Radio init | Power up DUT; observe serial | Readiness banner printed; no init-failure diagnostic (FR-3.1, FR-3.2) |
-| TC-2 | Carrier on 433.92 MHz | Trigger any button; observe SDR spectrum | Carrier bursts appear centered on 433.92 MHz (FR-1.1) |
-| TC-3 | Down replay | Send `d`; run `rtl_433` | Decodes `0x7f45c` (FR-1.2, FR-1.3, FR-1.4) |
-| TC-4 | Up replay | Send `u`; run `rtl_433` | Decodes `0x7f454` (FR-1.3) |
-| TC-5 | Auto replay | Send `a`; run `rtl_433` | Decodes `0x7f480` (FR-1.3) |
-| TC-6 | Manual replay | Send `m`; run `rtl_433` | Decodes `0x7f484` (FR-1.3) |
-| TC-7 | Word repetition | Capture one transmission | Codeword repeats ~12× with ~15.6 ms reset gaps (FR-1.5) |
-| TC-8 | Auto-cycle | Leave DUT idle; observe serial + SDR | All four codes transmitted in sequence with ~3 s spacing (FR-2.1) |
-| TC-9 | Serial trigger | Send each of `u/d/a/m` | Matching code transmitted; log line printed (FR-2.2, FR-3.2) |
-| TC-10 | LED mirror | Observe LED during TX | LED follows carrier activity (FR-2.3) |
-| TC-11 | Timing tolerance | Compare replayed vs original pulse widths | Within receiver tolerance; original receiver actuates (NFR-1) |
-| TC-12 | Init-failure path | Set wrong `LORA_RST`; power up | Diagnostic emitted; no transmission (FR-3.1) |
-| TC-13 | Extend to target | From 0, command extend to a target (e.g. 1 m); observe RF + awning | Down codeword sent, up counter-stop after ~(1 m / `SPEED_M_PER_S`); awning parks near 1 m; state `E` (FR-4.1, FR-4.2) |
-| TC-24 | Absolute-position delta | At 1 m, command extend to 2 m | Moves only +1 m (the delta), not a full 2 m from 0 (FR-4.4) |
-| TC-25 | Target clamp / no-op | Command a target > `MAX_TRAVEL_M`, and one equal to current | Clamped to max; no motion when already at target (FR-4.4) |
-| TC-14 | Up sequence | Issue up; observe RF + awning | Up codeword sent; awning runs to closed end-stop, no counter-stop; state `R` (FR-4.1, FR-4.3) |
-| TC-15 | Emergency retract command | Issue emergency command while extended | Immediate full retract regardless of state (FR-4.5) |
-| TC-16 | HA heartbeat watchdog | Stop the `awning/watchdog` heartbeat past `EMERGENCY_TIMEOUT_S` while still sending ordinary commands | Retract fires on heartbeat loss; ordinary commands do NOT reset the watchdog (FR-4.6) |
-| TC-17 | State reporting | Drive up/down; read reported state | State transitions E → M → R / R → M → E reported (FR-4.7) |
-| TC-18 | Conflicting command ignored | Issue down while already extended | Command ignored; no motion (FR-4.8) |
-| TC-19 | OLED state display | Power up; drive up/down | OLED shows RETRACTED/MOVING/EXTENDED with direction glyph (FR-5.1, FR-5.2) |
-| TC-20 | OLED down countdown | Issue down (e.g. 20 s) | OLED shows progress bar + countdown to counter-stop (FR-5.3) |
-| TC-21 | OLED connectivity | Observe header with WiFi/MQTT off | Shows offline indicators; updates when WiFi/MQTT present (FR-5.4) |
-| TC-22 | Position tracking / re-home | Extend 20 s, then retract; read reported position | Position rises while open; retract overshoots and resets to 0 at closed (FR-4.9, FR-4.10) |
-| TC-23 | Boot homing | Power up with the awning partly open | Device performs a full retract to closed, position 0 (FR-4.10) |
+| TC-1 | Radio init | Power up; observe serial | Readiness banner; no init-failure diagnostic (FR-3.1, FR-3.2) |
+| TC-2 | Carrier on 433.92 MHz | Trigger a command; observe SDR | Carrier bursts centred on 433.92 MHz (FR-1.1) |
+| TC-3 | Down codeword | Send `d`; run `rtl_433` | Decodes `0x7f45c` (FR-1.2, FR-1.3, FR-1.4) |
+| TC-4 | Up codeword | Send `u`; run `rtl_433` | Decodes `0x7f454` (FR-1.3) |
+| TC-5 | Word repetition | Capture one transmission | Codeword repeats ~12× with ~15.6 ms reset gaps (FR-1.5) |
+| TC-6 | Serial trigger | Send `u`/`d` | Matching code transmitted; log line printed (FR-2.1, FR-3.2) |
+| TC-7 | LED mirror | Observe LED during TX | LED follows carrier activity (FR-2.2) |
+| TC-8 | Timing tolerance | Compare replayed vs original pulse widths | Within receiver tolerance; awning responds (NFR-1) |
+| TC-9 | Init-failure path | Set wrong `LORA_RST`; power up | Diagnostic emitted; no transmission (FR-3.1) |
+| TC-10 | Extend to target | From 0, command extend to 1 m | Down codeword sent, up counter-stop after ~(1 m / `SPEED_M_PER_S`); parks near 1 m; state `E` (FR-4.1, FR-4.2) |
+| TC-11 | Absolute-position delta | At 1 m, command extend to 2 m | Moves only +1 m, not a full 2 m (FR-4.4) |
+| TC-12 | Target clamp / no-op | Command a target > `MAX_TRAVEL_M`, then one equal to current | Clamped to max; no motion when at target (FR-4.4) |
+| TC-13 | Retract | Command retract to 0 | Up codeword sent; awning to end-stop; state `R`; position 0 (FR-4.1, FR-4.3) |
+| TC-14 | Emergency retract | Issue emergency while extended | Immediate full retract regardless of state (FR-4.5) |
+| TC-15 | Heartbeat watchdog | Stop `awning/watchdog` past `EMERGENCY_TIMEOUT_S` while still sending ordinary commands | Retract fires on heartbeat loss; ordinary commands do not reset it (FR-4.6) |
+| TC-16 | State reporting | Drive up/down; read state | E → M → R / R → M → E reported (FR-4.7) |
+| TC-17 | No-op command | Command the current position | Ignored; no motion (FR-4.8) |
+| TC-18 | Position / re-home | Extend, then retract; read position | Position rises while open; retract overshoots and resets to 0 (FR-4.9, FR-4.10) |
+| TC-19 | Boot homing | Power up with the awning partly open | Full retract to closed, position 0 (FR-4.10) |
+| TC-20 | OLED state | Power up; drive up/down | OLED shows RETRACTED/MOVING/EXTENDED with glyph (FR-5.1, FR-5.2) |
+| TC-21 | OLED countdown | Extend to a target | OLED shows progress bar + countdown to counter-stop (FR-5.3) |
+| TC-22 | OLED connectivity | Observe header | Shows WiFi/MQTT indicators (FR-5.4) |
 
-### 8.3 Acceptance Criteria
-All **Must** FRs pass; each replayed codeword re-decodes identically to its original
-capture; the physical target device responds to at least one replayed button.
+### 7.3 Acceptance Criteria
+All **Must** FRs pass; each codeword re-decodes identically on the RTL-SDR; the awning
+reaches commanded positions and fully retracts on emergency and on heartbeat loss.
 
-### 8.4 Traceability Matrix
+### 7.4 Traceability Matrix
 
 | Requirement | Priority | Tests | Status |
 |-------------|----------|-------|--------|
 | FR-1.1 | Must | TC-2 | Covered |
-| FR-1.2 | Must | TC-3, TC-11 | Covered |
-| FR-1.3 | Must | TC-3, TC-4, TC-5, TC-6 | Covered |
-| FR-1.4 | Must | TC-3, TC-7 | Covered |
-| FR-1.5 | Should | TC-7 | Covered |
-| FR-2.1 | Must | TC-8 | Covered |
-| FR-2.2 | Should | TC-9 | Covered |
-| FR-2.3 | May | TC-10 | Covered |
-| FR-3.1 | Must | TC-1, TC-12 | Covered |
-| FR-3.2 | Should | TC-1, TC-9 | Covered |
-| FR-4.1 | Must | TC-13, TC-14 | Covered |
-| FR-4.2 | Must | TC-13 | Covered |
-| FR-4.3 | Must | TC-14 | Covered |
-| FR-4.4 | Must | TC-24, TC-25 | Covered |
-| FR-4.5 | Must | TC-15 | Covered |
-| FR-4.6 | Should | TC-16 | Covered |
-| FR-4.7 | Should | TC-17 | Covered |
-| FR-4.8 | Should | TC-18 | Covered |
-| FR-4.9 | Must | TC-22 | Covered |
-| FR-4.10 | Must | TC-22, TC-23 | Covered |
-| FR-5.1 | Should | TC-19 | Covered |
-| FR-5.2 | Should | TC-19 | Covered |
-| FR-5.3 | Should | TC-20 | Covered |
-| FR-5.4 | Should | TC-21 | Covered |
-| FR-5.5 | May | TC-19 | Covered |
+| FR-1.2 | Must | TC-3, TC-8 | Covered |
+| FR-1.3 | Must | TC-3, TC-4 | Covered |
+| FR-1.4 | Must | TC-3 | Covered |
+| FR-1.5 | Should | TC-5 | Covered |
+| FR-2.1 | Should | TC-6 | Covered |
+| FR-2.2 | May | TC-7 | Covered |
+| FR-3.1 | Must | TC-1, TC-9 | Covered |
+| FR-3.2 | Should | TC-1, TC-6 | Covered |
+| FR-4.1 | Must | TC-10, TC-13 | Covered |
+| FR-4.2 | Must | TC-10 | Covered |
+| FR-4.3 | Must | TC-13 | Covered |
+| FR-4.4 | Must | TC-11, TC-12 | Covered |
+| FR-4.5 | Must | TC-14 | Covered |
+| FR-4.6 | Must | TC-15 | Covered |
+| FR-4.7 | Should | TC-16 | Covered |
+| FR-4.8 | Should | TC-17 | Covered |
+| FR-4.9 | Must | TC-18 | Covered |
+| FR-4.10 | Must | TC-18, TC-19 | Covered |
+| FR-5.1 | Should | TC-20 | Covered |
+| FR-5.2 | Should | TC-20 | Covered |
+| FR-5.3 | Should | TC-21 | Covered |
+| FR-5.4 | Should | TC-22 | Covered |
+| FR-5.5 | May | TC-20 | Covered |
 | FR-5.6 | May | — | GAP |
-| NFR-1 | Must | TC-11 | Covered |
-| NFR-2 | Should | TC-2 (bench setup) | Covered |
-| NFR-3 | Must | Operational control (Section 7) | Procedural |
+| NFR-1 | Must | TC-8 | Covered |
+| NFR-2 | Should | TC-2 | Covered |
+| NFR-3 | Must | Operational control (Section 6) | Procedural |
 | NFR-4 | May | Build size report | Covered |
 
-## 9. Troubleshooting
+## 8. Troubleshooting
 
 | Symptom | Likely Cause | Action |
 |---------|--------------|--------|
-| `beginFSK failed` on boot | Wrong `LORA_RST` for board variant | Set RST to 23 (v2.1) or 14 (v1.0); re-flash |
-| No RF on any button | 868/915 MHz SX1276 fitted, or no antenna | Confirm 433 MHz SX1278 variant; attach antenna |
-| RTL-SDR shows garbage / overload | TX too strong at close range | Lower `TX_POWER`; add distance/attenuation |
-| Original receiver ignores replay | Short-pulse timing distorted by SPI keying | Reduce interference; use Phase 3 DIO2 direct keying |
-| Flash fails: `Wrong boot mode (0x13)` | DTR/RTS auto-reset not entering bootloader over RFC2217 | Force download mode (GPIO0 low at reset), then upload |
+| `beginFSK failed` on boot | Wrong `LORA_RST` | Set RST to 23; re-flash |
+| No RF on any command | Wrong band SX1276, or no antenna | Confirm 433 MHz SX1278; attach antenna |
+| RTL-SDR overloads | TX too strong at close range | Lower `TX_POWER`; add distance/attenuation |
+| Awning doesn't reach position | `SPEED_M_PER_S` miscalibrated | Recalibrate speed against a measured run |
+| Awning retracts unexpectedly | `awning/watchdog` heartbeat missing | Check the HA automation and MQTT link |
+| Flash fails: `Wrong boot mode (0x13)` | RFC2217 auto-reset can't enter bootloader | Flash locally via workbench `POST /api/flash` |
 
-## 10. Appendix
+## 9. Appendix
 
-### 10.1 Captured Codewords
-| Button | Code (`{18}` hex) | Notes |
-|--------|-------------------|-------|
-| up | `0x7f454` | Fixed |
-| down | `0x7f45c` | Fixed |
-| auto | `0x7f480` | Fixed |
-| manual | `0x7f484` | Fixed; differs from up by one bit |
+### 9.1 Remote Codewords
+| Button | Code (`{18}` hex) | Use |
+|--------|-------------------|-----|
+| up | `0x7f454` | retract |
+| down | `0x7f45c` | extend |
+| auto | `0x7f480` | unused |
+| manual | `0x7f484` | unused |
 
-### 10.2 Toolchain
-- PlatformIO (`espressif32`), Arduino framework, RadioLib.
-- Display: U8g2 (or Adafruit SSD1306 + GFX) for the onboard OLED.
+### 9.2 Toolchain
+- PlatformIO (`espressif32`), Arduino, RadioLib; U8g2 (or Adafruit SSD1306 + GFX).
 - Board: `ttgo-lora32-v21`.
-- Capture: `rtl_433` v25.02 on the workbench RTL-SDR (RTL2838, R820T tuner).
+- Capture: `rtl_433` on the workbench RTL-SDR (RTL2838, R820T tuner).
 
-### 10.3 Repository Layout
-- `src/main.cpp` — firmware (codeword table, timing template, keying, control).
+### 9.3 Repository Layout
+- `src/main.cpp` — firmware (codewords, timing template, keying, motion, control).
 - `platformio.ini` — build/upload configuration.
 - `README.md` — quick-start and capture workflow.
 - `documentation/ookTransmitter-fsd.md` — this document.
 
-### 10.4 Legacy Awning Control (Node-RED, disabled)
+### 9.4 Home Assistant Awning Automation
 
-The 433.92 MHz remote replayed by this device is an **awning** controller. A prior,
-now-**disabled** Node-RED flow named **"Awning"** (tab `e1c2ca1342eeb2fd`, in
-`flows.json` on the IOTstack hub `192.168.0.203`) drove the awning over MQTT before
-this device existed. It is captured here as background for the intended MQTT/auto
-behaviour of the new firmware.
+Home Assistant is the wind-safety authority. Its awning automation commands the device
+over MQTT and publishes the `awning/watchdog` heartbeat (FR-4.6). Automation parameters,
+driven by the weather-station wind, lux, and temperature:
 
-**Control model:** the flow published short codes to MQTT topics `awning/command`
-and `curtain/command`. The letter is direction, the trailing number is a
-sequence/parameter:
-
-- **`X#` = eXtend** (awning out — corresponds to **down**)
-- **`R#` = Retract** (awning in — corresponds to **up**)
-
-| Origin | Code | Meaning |
-|--------|------|---------|
-| Telegram `e` (manual) | `X6` | extend |
-| Telegram `r` (manual) | `R7` | retract |
-| Auto "Commander" | `X7` | extend |
-| Auto "Commander" | `R9` | retract / emergency |
-
-Distinct codes observed across the flows: `X1, X6, X7, R7, R9`.
-
-**Auto logic ("Commander" function):** driven by global vars `wind`,
-`SolarIntensity` (Lux), `temp`:
 - Extend when `Lux ≥ 3.0` **and** `temp ≥ 20 °C` **and** `wind ≤ 20`.
 - Retract when `Lux < 1.0` **or** `temp < 18 °C`.
-- **Emergency retract when `wind > 25`.**
-- Minimum 10 minutes between movements.
+- Emergency retract when `wind > 25`.
+- Move at most once per 10 minutes.
 
-The flow also had a Telegram bot for manual `e`/`r` control and status messages, and
-a `Store Command` node tracking a `commandSent` flag (`X6`→1, `R7`→0).
+MQTT topics: `awning/command` (targets to the device), `awning/status` (device state),
+`awning/watchdog` (HA liveness heartbeat).
 
-**Legacy device firmware (resolves the sequence).** An ESP32 subscribed to
-`awning/command`, parsed `command = payload[0]` (`X`/`R`) and `dur = payload[1] − '0'`
-(a single digit 0–9), and keyed a 433 MHz OOK transmitter on GPIO4. This resolves the
-previously open items:
+## 10. Related
 
-**1. The numeric suffix is `dur`, a movement *time*** — not a repeat count or
-position. Movement time = **`dur × 5 s`**; the awning simply runs for that long. The
-distance opened is only the emergent result of the run time.
-
-| Command | `dur` | Move time |
-|---------|-------|-----------|
-| `X6` (normal manual **down**) | 6 | **30 s** |
-| `X7` (auto down) | 7 | 35 s |
-| `X1` | 1 | 5 s |
-| `R7` (manual **up**) | 7 | 35 s |
-| `R9` (auto / emergency up) | 9 | 45 s |
-| boot default (`dur = 5`) | 5 | 25 s |
-
-Single digit ⇒ `dur × 5` caps at 45 s.
-
-**2. Motion model — the "sequence".** The awning motor runs in one direction until a
-**counter-command** stops it (per the firmware's header comment). The two directions
-are therefore asymmetric:
-
-- **Down / extend (`X#`):** send `extendCommand` → wait **`dur × 5 s`** → send
-  `retractCommand` **once as a stop** → state `E` (parked at a partial extension set by
-  the run time).
-- **Up / retract (`R#`):** send `retractCommand` → runs to the closed mechanical
-  end-stop and **self-stops** → state `R`. No counter-command; its `dur × 5 s` is only a
-  "closed" status timer.
-- **Emergency:** no command for 120 s → auto-retract.
-
-**3. RF codes = the captured buttons.** `extendCommand` / `retractCommand` are the
-**down** / **up** codes of §10.1 (they differ by one bit, matching `down 0x7f45c` vs
-`up 0x7f454`). `manCommand` / `autoCommand` are defined but **never used** — only
-extend/retract drove the awning. Each command is transmitted **5×** per action.
-
-**4. Legacy RF encoding (reference only).** The legacy device bit-banged these
-symbolic pulse strings on a plain OOK transmitter (GPIO4), reverse-engineered with
-**URH** (the author notes `rtl_433` does not decode it reliably). **The new firmware
-does NOT use this bit-banged encoding** — it reproduces the same up/down RF from the
-§10.1 captured codewords via **RadioLib SX1278 DIO2 keying**, which is verified to move
-the awning. The strings are kept here only as the legacy reference:
-
-| Symbol | Meaning | Timing |
-|--------|---------|--------|
-| `L` | long pulse (on) | 2000 µs |
-| `S` | short pulse (on) | 350 µs |
-| `G` | short gap (off) | 250 µs |
-| `P` | long gap (off) | 2000 µs |
-| `N` | end-of-frame gap | 16000 µs |
-
-- `extendCommand`  = `LGSPSPSPSPSPSPSPLGSPLGLGLGSPLGSPSPSN`
-- `retractCommand` = `LGSPSPSPSPSPSPSPLGSPLGLGLGSPLGSPLGSN`
-
-These legacy timings sit within the receiver's tolerance of the §10.1 captured values
-that the new firmware transmits via RadioLib.
-
-**Design note for the new firmware.** The new device is **not** bound to the old
-single-digit `dur × 5 s` MQTT encoding. Instead it controls the awning by **absolute
-position in metres** (§2.5, §4.1 FR-4.4): commands carry a target position, the device
-moves only the delta via the `SPEED_M_PER_S` calibration factor, and full retracts
-re-home to 0. The legacy relationship still maps directly — extend/`X#` is **down**,
-retract/`R#` is **up**, and `dur × 5 s` was the legacy stop delay that the metres model
-now derives from distance ÷ speed. Only **up/down** are used; the auto/manual RF codes
-are unused by the actuator.
-
-## 11. Related
-
-- [[Embedded-Workbench-FSD]] — the workbench that hosts the RTL-SDR receiver and
-  flashes this DUT.
-- [[signal-generator]] — the workbench's RF transmit source (Si5351/GPCLK), a
-  complementary TX path.
+- [[Embedded-Workbench-FSD]] — the workbench hosting the RTL-SDR receiver and flashing the
+  device.
+- [[signal-generator]] — the workbench RF transmit source (Si5351/GPCLK).
