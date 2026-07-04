@@ -24,6 +24,7 @@
 #define LORA_RST   23
 #define LORA_DIO0  26
 #define LORA_DIO1  33
+#define LORA_DIO2  32   // SX1278 DIO2 = OOK DATA pin in direct mode
 #define LED_PIN    25   // onboard LED (some variants: GPIO2)
 
 #define FREQ_MHZ   433.92
@@ -58,9 +59,9 @@ static const uint32_t PERIOD_MS = 3000;  // wait between buttons
 
 static bool radioReady = false;
 
-static void carrier(bool on) {
-  if (on) { radio.transmitDirect(); digitalWrite(LED_PIN, HIGH); }
-  else    { radio.standby();        digitalWrite(LED_PIN, LOW);  }
+static inline void carrier(bool on) {
+  digitalWrite(LORA_DIO2, on ? HIGH : LOW);   // DIO2 = OOK DATA in direct mode
+  digitalWrite(LED_PIN,   on ? HIGH : LOW);
 }
 
 // Transmit one button's codeword REPEATS times, reconstructing the pulse train
@@ -98,7 +99,13 @@ void setup() {
   radio.setOOK(true);
   radio.setFrequency(FREQ_MHZ);
   radio.setOutputPower(TX_POWER);
-  radio.standby();
+
+  // Direct OOK keying: in continuous direct mode the carrier is gated by the
+  // SX1278 DIO2 DATA pin (GPIO32 on T3 v1.6.1). Enter direct TX once, then key
+  // the carrier by driving DIO2 from the MCU for accurate microsecond timing.
+  pinMode(LORA_DIO2, OUTPUT);
+  digitalWrite(LORA_DIO2, LOW);
+  radio.transmitDirect();
 
   radioReady = true;
   Serial.printf("Ready. %u buttons, %u repeats each @ %.2f MHz\n",

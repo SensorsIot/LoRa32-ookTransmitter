@@ -69,26 +69,30 @@ burst with the same timing you captured.
 
 ## Board wiring (TTGO LoRa32, SX1278)
 
-| SX1278 | ESP32 GPIO |
-|--------|-----------|
-| SCK    | 5  |
-| MISO   | 19 |
-| MOSI   | 27 |
-| NSS    | 18 |
-| RST    | 23 (v2.1) / 14 (v1.0) |
-| DIO0   | 26 |
-| DIO1   | 33 |
+Verified on a LilyGO TTGO LoRa32 **T3 v1.6.1** (SX1278):
+
+| SX1278 | ESP32 GPIO | Role |
+|--------|-----------|------|
+| SCK    | 5  | SPI clock |
+| MISO   | 19 | SPI in |
+| MOSI   | 27 | SPI out |
+| NSS    | 18 | SPI chip select |
+| RST    | 23 | Radio reset (14 on the older v1.0) |
+| DIO0   | 26 | RadioLib IRQ |
+| DIO1   | 33 | RadioLib IRQ |
+| DIO2   | 32 | **OOK DATA — carrier keying** |
 
 Set the board version in `platformio.ini` (`ttgo-lora32-v21` / `ttgo-lora32-v1`). If
-`beginFSK` fails, the `RST` pin is the usual culprit.
+`beginFSK` fails, the `RST` pin is the usual culprit; if it initializes but no RF is
+emitted, `DIO2` is not reaching GPIO32.
 
 ## Notes
 
 - **RTL-SDR overload**: transmitting at close range into the RTL-SDR can saturate it.
   Keep `TX_POWER` low, add distance, or attenuate. The Pi is power-sensitive — don't
   transmit into it while flashing other devices.
-- **Timing precision**: the carrier is keyed via SPI mode switches, so sub-~200 µs
-  pulses are distorted. For microsecond-accurate replay, drive the SX1278 `DIO2` DATA
-  pin directly in continuous mode (future enhancement).
+- **Keying method**: the SX1278 runs in continuous direct mode (`transmitDirect()`),
+  and the carrier is keyed by driving `DIO2` (GPIO32) from the MCU. This gives
+  microsecond-accurate OOK timing — verified by the RTL-SDR re-decoding all four codes.
 - **433.92 MHz is licensed spectrum.** Only retransmit signals you are authorized to,
   at legal power/duty-cycle for your region.
