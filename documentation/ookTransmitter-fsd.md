@@ -56,6 +56,10 @@ board bring-up. Out of scope: signal capture/decoding (performed externally by
 - **Firmware**: PlatformIO / Arduino framework using the RadioLib library.
 - **Capture toolchain (external)**: RTL-SDR + `rtl_433` on the workbench Raspberry Pi.
 - **Host/operator interface**: USB serial (CH9102) at 115200 baud + the OLED.
+- **Wind-safety controller (external)**: Home Assistant — using the site weather-station
+  wind sensor — runs the awning automation and publishes the liveness heartbeat the
+  device watches (§4.1 FR-4.6). The device has **no local wind sensor**; wind safety is
+  delegated to HA, with the heartbeat watchdog as the fail-safe.
 
 ### 2.2 Architecture Summary
 
@@ -110,8 +114,9 @@ directions are asymmetric:
   parks at the partial extension reached during that time.
 - **Up / retract:** transmit the **up** codeword; the awning runs to its closed
   mechanical end-stop and self-stops. No counter-stop.
-- **Emergency retract:** a full retract, triggered on demand or by a no-command
-  watchdog, regardless of current state.
+- **Emergency retract:** a full retract, regardless of state — triggered on demand, on
+  loss of the Home Assistant automation heartbeat, or on an explicit unsafe heartbeat
+  (§4.1 FR-4.6). Retracted is the safe state, so the device fails closed.
 
 Each codeword is transmitted several times per action (default 5×, per the RF model in
 §2.3). Awning state is tracked as extended (`E`), moving (`M`), or retracted (`R`). Only
@@ -183,8 +188,13 @@ the up/down codewords are used for motion; the auto/manual codewords (§10.1) ar
   legacy `X6` value).
 - **FR-4.5** [Must]: The device shall provide an **emergency-retract command** that
   immediately performs a full retract regardless of current state (wind/storm safety).
-- **FR-4.6** [Should]: The device shall perform an **automatic emergency retract** if no
-  command is received within a configurable watchdog timeout (default 120 s).
+- **FR-4.6** [Must]: The device shall monitor a periodic **liveness heartbeat published
+  by the Home Assistant awning automation** (topic `awning/watchdog`, ~30 s interval).
+  If no heartbeat arrives within `EMERGENCY_TIMEOUT_S` (default 120 s), **or** a
+  heartbeat explicitly signals an unsafe condition, the device shall perform an
+  emergency retract (fail-safe: HA / automation / link presumed down). **Ordinary
+  command traffic shall not reset the watchdog — only the heartbeat**, so the timer
+  proves the wind-safety automation itself is alive, not merely that the broker is up.
 - **FR-4.7** [Should]: The device shall track and report awning state — extended (`E`),
   moving (`M`), retracted (`R`).
 - **FR-4.8** [Should]: The device shall ignore a direction command that conflicts with
@@ -235,6 +245,9 @@ the up/down codewords are used for motion; the auto/manual codewords (§10.1) ar
 | A-2 | Assumption | All four buttons share one timing template. | Verified: identical timing across captures. |
 | D-1 | Dependency | RadioLib SX127x driver (OOK direct mode). | Pinned in `platformio.ini`. |
 | D-2 | Dependency | External capture via `rtl_433` for any new remote. | Documented workflow. |
+| A-3 | Assumption | Wind data exists only in Home Assistant (weather station); the device has no local wind sensor and delegates wind safety to HA. | Heartbeat watchdog retracts on HA/automation/link loss (FR-4.6). |
+| R-4 | Risk | A fast gust while HA is alive but slow to react leaves the awning exposed — no local sensor can beat HA's reaction time. | Conservative wind threshold + prompt retract in the HA automation; accept as a documented limitation. |
+| D-3 | Dependency | Home Assistant awning automation publishing the `awning/watchdog` heartbeat. | Specified in §4.1 FR-4.6. |
 
 ## 6. Interfaces
 
@@ -259,7 +272,8 @@ the up/down codewords are used for motion; the auto/manual codewords (§10.1) ar
 | `BUTTONS[]` | 4 codewords | Captured remote codes |
 | `CMD_REPEATS` | 5 | Codeword transmissions per motion action (FR-4.1) |
 | `MOVEMENT_TIME_S` | 30 | Default down extend→counter-stop delay, seconds (FR-4.4) |
-| `EMERGENCY_TIMEOUT_S` | 120 | No-command watchdog before auto-retract (FR-4.6) |
+| `EMERGENCY_TIMEOUT_S` | 120 | HA-heartbeat-loss watchdog before auto-retract (FR-4.6) |
+| `WATCHDOG_TOPIC` | `awning/watchdog` | HA automation heartbeat the watchdog monitors (FR-4.6) |
 
 ### 6.4 OLED Status Display
 
@@ -335,7 +349,7 @@ at bench distance and reduced TX power.
 | TC-13 | Down sequence | Issue down (movement time e.g. 5 s); observe RF + awning | Down codeword sent, up codeword sent once ~5 s later; awning parks partially open; state `E` (FR-4.1, FR-4.2, FR-4.4) |
 | TC-14 | Up sequence | Issue up; observe RF + awning | Up codeword sent; awning runs to closed end-stop, no counter-stop; state `R` (FR-4.1, FR-4.3) |
 | TC-15 | Emergency retract command | Issue emergency command while extended | Immediate full retract regardless of state (FR-4.5) |
-| TC-16 | Emergency watchdog | Send no command past the watchdog timeout | Automatic full retract occurs (FR-4.6) |
+| TC-16 | HA heartbeat watchdog | Stop the `awning/watchdog` heartbeat past `EMERGENCY_TIMEOUT_S` while still sending ordinary commands | Retract fires on heartbeat loss; ordinary commands do NOT reset the watchdog (FR-4.6) |
 | TC-17 | State reporting | Drive up/down; read reported state | State transitions E → M → R / R → M → E reported (FR-4.7) |
 | TC-18 | Conflicting command ignored | Issue down while already extended | Command ignored; no motion (FR-4.8) |
 | TC-19 | OLED state display | Power up; drive up/down | OLED shows RETRACTED/MOVING/EXTENDED with direction glyph (FR-5.1, FR-5.2) |
