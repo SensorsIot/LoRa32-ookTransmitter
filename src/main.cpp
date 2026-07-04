@@ -33,14 +33,18 @@ SX1278 radio = new Module(LORA_NSS, LORA_DIO0, LORA_RST, LORA_DIO1);
 
 // ---- Captured OOK burst ----
 // Alternating durations in microseconds: mark(on), space(off), mark, space...
-// Placeholder = a trivial pattern. REPLACE with your rtl_433 -A capture.
+// Captured from a 433.92 MHz remote "down" button via rtl_433 -A on the
+// workbench RTL-SDR. 18-bit fixed PWM codeword 0x7f45c: each bit is a long
+// (~2150 us) or short (~416 us) pulse followed by a gap, one word ends with a
+// ~15.6 ms reset gap. Verified: pulse widths match rtl_433's decoded bits.
 static const uint16_t PULSES[] = {
-  500, 1000, 1000, 500, 500, 1000, 1000, 500,
-  500, 1000, 500, 1000, 1000, 500, 500, 1000
+  2152,  172,   416, 1908,   420, 1908,   416, 1912,   416, 1908,   420, 1908,
+   416, 1912,   416, 1908,  2152,  172,   416, 1908,  2152,  172,  2148,  172,
+  2152,  172,   416, 1912,  2148,  172,   416, 1912,   416, 1908,   420, 15588
 };
 static const size_t   PULSE_COUNT    = sizeof(PULSES) / sizeof(PULSES[0]);
-static const uint32_t GAP_BETWEEN_MS = 200;  // idle between repeats within a transmission
-static const uint8_t  REPEATS        = 5;    // bursts per transmission
+static const uint32_t GAP_BETWEEN_MS = 8;    // extra idle between word repeats (word already ends in 15.6 ms)
+static const uint8_t  REPEATS        = 12;   // words per transmission (real remote sent ~50)
 static const uint32_t PERIOD_MS      = 3000; // wait before the next transmission
 
 static bool radioReady = false;
