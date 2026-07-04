@@ -31,21 +31,30 @@
 
 SX1278 radio = new Module(LORA_NSS, LORA_DIO0, LORA_RST, LORA_DIO1);
 
-// ---- Captured OOK burst ----
-// Alternating durations in microseconds: mark(on), space(off), mark, space...
-// Captured from a 433.92 MHz remote "down" button via rtl_433 -A on the
-// workbench RTL-SDR. 18-bit fixed PWM codeword 0x7f45c: each bit is a long
-// (~2150 us) or short (~416 us) pulse followed by a gap, one word ends with a
-// ~15.6 ms reset gap. Verified: pulse widths match rtl_433's decoded bits.
-static const uint16_t PULSES[] = {
-  2152,  172,   416, 1908,   420, 1908,   416, 1912,   416, 1908,   420, 1908,
-   416, 1912,   416, 1908,  2152,  172,   416, 1908,  2152,  172,  2148,  172,
-  2152,  172,   416, 1912,  2148,  172,   416, 1912,   416, 1908,   420, 15588
+// ---- Captured remote (433.92 MHz OOK-PWM) ----
+// Four buttons captured with rtl_433 -A on the workbench RTL-SDR. Each is an
+// 18-bit FIXED codeword (fixed, not rolling -> replayable). The values below are
+// exactly as rtl_433 prints them: {18} hex, i.e. the top 18 bits of this 20-bit
+// field, first transmitted bit = MSB.
+struct Button { const char* name; uint32_t code; };
+static const Button BUTTONS[] = {
+  { "up",     0x7f454 },
+  { "down",   0x7f45c },
+  { "auto",   0x7f480 },
+  { "manual", 0x7f484 },
 };
-static const size_t   PULSE_COUNT    = sizeof(PULSES) / sizeof(PULSES[0]);
-static const uint32_t GAP_BETWEEN_MS = 8;    // extra idle between word repeats (word already ends in 15.6 ms)
-static const uint8_t  REPEATS        = 12;   // words per transmission (real remote sent ~50)
-static const uint32_t PERIOD_MS      = 3000; // wait before the next transmission
+static const uint8_t NUM_BUTTONS = sizeof(BUTTONS) / sizeof(BUTTONS[0]);
+static const uint8_t CODE_BITS   = 18;
+
+// OOK-PWM timing template (microseconds), measured from the capture and verified
+// against rtl_433's decoded bits: bit 0 = long pulse, bit 1 = short pulse. Each
+// bit is one pulse + gap; the last bit of a word is followed by the reset gap.
+static const uint16_t LONG_MARK  = 2150, LONG_SPACE  = 172;
+static const uint16_t SHORT_MARK =  416, SHORT_SPACE = 1908;
+static const uint16_t RESET_GAP  = 15588;   // inter-word reset (< 16383 us delayMicroseconds limit)
+
+static const uint8_t  REPEATS   = 12;    // words per transmission (real remote sent ~50)
+static const uint32_t PERIOD_MS = 3000;  // wait between buttons
 
 static bool radioReady = false;
 
@@ -54,12 +63,20 @@ static void carrier(bool on) {
   else    { radio.standby();        digitalWrite(LED_PIN, LOW);  }
 }
 
-static void replayBurst() {
-  for (size_t i = 0; i < PULSE_COUNT; i++) {
-    carrier((i % 2) == 0);        // even index = mark (on), odd = space (off)
-    delayMicroseconds(PULSES[i]);
+// Transmit one button's codeword REPEATS times, reconstructing the pulse train
+// from the timing template. Bits are read MSB-first from the top 18 of the field.
+static void sendButton(const Button& b) {
+  for (uint8_t r = 0; r < REPEATS; r++) {
+    for (int8_t bit = 19; bit >= 2; bit--) {
+      bool one = (b.code >> bit) & 0x1;
+      carrier(true);
+      delayMicroseconds(one ? SHORT_MARK : LONG_MARK);
+      carrier(false);
+      bool lastBit = (bit == 2);
+      delayMicroseconds(lastBit ? RESET_GAP : (one ? SHORT_SPACE : LONG_SPACE));
+    }
   }
-  carrier(false);                 // leave carrier off after the burst
+  carrier(false);
 }
 
 void setup() {
@@ -84,17 +101,34 @@ void setup() {
   radio.standby();
 
   radioReady = true;
-  Serial.printf("Ready. %u pulses/burst, %u repeats @ %.2f MHz\n",
-                (unsigned)PULSE_COUNT, REPEATS, FREQ_MHZ);
+  Serial.printf("Ready. %u buttons, %u repeats each @ %.2f MHz\n",
+                NUM_BUTTONS, REPEATS, FREQ_MHZ);
+  Serial.println(F("Serial: u=up d=down a=auto m=manual (or auto-cycles all)"));
+}
+
+static void transmitByKey(char c) {
+  for (uint8_t i = 0; i < NUM_BUTTONS; i++) {
+    if (c == BUTTONS[i].name[0]) {
+      Serial.printf("TX %s (0x%05x)\n", BUTTONS[i].name, BUTTONS[i].code);
+      sendButton(BUTTONS[i]);
+      return;
+    }
+  }
 }
 
 void loop() {
   if (!radioReady) { delay(1000); return; }
 
-  Serial.println(F("TX burst"));
-  for (uint8_t r = 0; r < REPEATS; r++) {
-    replayBurst();
-    delay(GAP_BETWEEN_MS);
+  // Manual trigger over serial: u / d / a / m
+  if (Serial.available()) {
+    transmitByKey(Serial.read());
+    return;
   }
-  delay(PERIOD_MS);
+
+  // Hands-free: cycle through every button so a receiver sees all four codes.
+  for (uint8_t i = 0; i < NUM_BUTTONS; i++) {
+    Serial.printf("TX %s (0x%05x)\n", BUTTONS[i].name, BUTTONS[i].code);
+    sendButton(BUTTONS[i]);
+    delay(PERIOD_MS);
+  }
 }

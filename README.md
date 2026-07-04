@@ -9,14 +9,32 @@ retransmit the same pulse train from a TTGO LoRa32 (SX1278) board.
 ```
   433 MHz remote  ──RF──►  RTL-SDR + rtl_433   ──►  pulse/gap timings (µs)
                             (workbench Pi)              │
-                                                        ▼  transcribe into PULSES[]
+                                                        ▼  codeword + timing → firmware
   TTGO LoRa32 (SX1278)  ◄──────── src/main.cpp ─────────┘
         │
         └──RF──►  replayed 433.92 MHz OOK burst
 ```
 
-The SX1278 runs in FSK/OOK mode. The firmware keys the carrier on/off according to a
-timing array (`PULSES[]`), reproducing the captured waveform.
+The SX1278 runs in FSK/OOK mode. The firmware keys the carrier on/off to reconstruct
+each captured codeword from a shared timing template, reproducing the original waveform.
+
+## Captured remote
+
+A 4-button 433.92 MHz remote, captured with `rtl_433 -A` on the workbench RTL-SDR.
+Each button is an 18-bit **fixed** OOK-PWM codeword (fixed, not rolling — so it
+replays correctly):
+
+| Button | Code (`{18}` hex) |
+|--------|-------------------|
+| up     | `0x7f454` |
+| down   | `0x7f45c` |
+| auto   | `0x7f480` |
+| manual | `0x7f484` |
+
+Timing template (measured, verified against rtl_433's bits): bit `0` = long pulse
+~2150 µs, bit `1` = short pulse ~416 µs; each bit is one pulse + gap, and a word ends
+with a ~15.6 ms reset gap. The firmware auto-cycles all four buttons, or triggers one
+on a serial keypress: `u` / `d` / `a` / `m`.
 
 ## 1. Capture with rtl_433 (on the workbench Pi)
 
@@ -28,9 +46,10 @@ rtl_433 -f 433.92M
 rtl_433 -A -f 433.92M
 ```
 
-Trigger your 433 MHz device while `-A` is running. `rtl_433` prints the mark/space
-(pulse/gap) widths. Copy them into `PULSES[]` in `src/main.cpp`, alternating
-`mark, space, mark, space, …`, starting with the carrier ON.
+Trigger your 433 MHz device while `-A` is running. `rtl_433` prints the decoded
+codeword (e.g. `{18}7f45c`) and the pulse/gap widths. Add the codeword to `BUTTONS[]`
+in `src/main.cpp`; if the timing differs from this remote, adjust the pulse template
+constants (`LONG_MARK`, `SHORT_MARK`, gaps, `RESET_GAP`).
 
 ## 2. Build & flash
 
