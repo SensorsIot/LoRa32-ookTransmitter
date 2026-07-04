@@ -553,13 +553,13 @@ These legacy timings sit within the receiver's tolerance of the §10.1 captured 
 that the new firmware transmits via RadioLib.
 
 **Design note for the new firmware.** The new device is **not** bound to the old
-single-digit `dur × 5 s` MQTT encoding — it should accept a **movement time in seconds
-directly** (finer, and beyond 45 s). Concretely:
-
-- **Down** takes a stop-delay parameter in seconds (default = the legacy `X6` value,
-  **30 s**): extend → wait → counter-stop.
-- **Up** is fire-and-forget (retract to the end-stop); no parameter.
-- Only **up/down** are required; the auto/manual RF codes are unused by the actuator.
+single-digit `dur × 5 s` MQTT encoding. Instead it controls the awning by **absolute
+position in metres** (§2.5, §4.1 FR-4.4): commands carry a target position, the device
+moves only the delta via the `SPEED_M_PER_S` calibration factor, and full retracts
+re-home to 0. The legacy relationship still maps directly — extend/`X#` is **down**,
+retract/`R#` is **up**, and `dur × 5 s` was the legacy stop delay that the metres model
+now derives from distance ÷ speed. Only **up/down** are used; the auto/manual RF codes
+are unused by the actuator.
 
 ## 11. Related
 
