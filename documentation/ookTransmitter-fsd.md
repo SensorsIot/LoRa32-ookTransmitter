@@ -508,6 +508,7 @@ reaches commanded positions and fully retracts on emergency and on heartbeat los
 - `platformio.ini` — build/upload configuration.
 - `README.md` — quick-start and capture workflow.
 - `documentation/ookTransmitter-fsd.md` — this document.
+- `homeassistant/awning.yaml` — Home Assistant automation + watchdog heartbeat (§9.4).
 
 ### 9.4 Home Assistant Awning Automation
 
