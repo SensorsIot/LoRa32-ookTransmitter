@@ -330,8 +330,13 @@ countdown to the counter-stop.
  +----------------------+          +----------------------+
 ```
 
-- State glyphs: `^` retracted (in), `v` extended (out), animated during `MOVING`.
-- Library: U8g2, or Adafruit SSD1306 + GFX.
+- Idle shows the state (16 pt) above a large position readout (24 pt); a move
+  shows the direction, a progress bar, and the target; the footer carries the
+  IP/AP and a WiFi/MQTT indicator.
+- Driver: ThingPulse `SSD1306Wire`. The panel's RST line (GPIO 16) is **not**
+  driven — toggling it hangs the ESP32 I2C peripheral (`arduino-esp32` #4278).
+  Guarded by an `OLED_ENABLED` build flag; when disabled the device runs
+  headless (status is still on the web page and MQTT).
 
 ### 5.5 MQTT / Home Assistant Interface
 - Broker: plain, `MQTT_PORT` (1883); host and credentials from NVS.

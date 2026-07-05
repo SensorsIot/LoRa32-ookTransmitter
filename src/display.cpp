@@ -1,23 +1,30 @@
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <SSD1306Wire.h>
 #include "display.h"
 #include "motion.h"
 #include "net.h"
 
-static Adafruit_SSD1306 oled(OLED_W, OLED_H, &Wire, OLED_RST);
+// LILYGO LoRa32 V2.1_1.6.1 OLED: driven by the ThingPulse SSD1306Wire driver
+// (the Adafruit driver hangs this panel's I2C). Its RST line is intentionally
+// NOT toggled — driving GPIO16 hangs the I2C peripheral (arduino-esp32 #4278),
+// which was the TG1WDT boot loop. This matches OpenMQTTGateway's board config.
+static SSD1306Wire oled(OLED_ADDR, OLED_SDA, OLED_SCL, GEOMETRY_128_64);
 static bool s_ok = false;
 
 void displayInit() {
-  Wire.begin(OLED_SDA, OLED_SCL);
-  s_ok = oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
-  if (!s_ok) { Serial.println(F("SSD1306 init failed")); return; }
-  oled.clearDisplay();
-  oled.setTextColor(SSD1306_WHITE);
-  oled.setTextSize(1);
-  oled.setCursor(0, 0);
-  oled.println(F("Awning"));
+#if !OLED_ENABLED
+  // OLED disabled (see config.h): status is exposed over web/MQTT instead.
+  Serial.println(F("OLED disabled (OLED_ENABLED=0)"));
+  s_ok = false;
+  return;
+#else
+  oled.init();
+  oled.setTextAlignment(TEXT_ALIGN_LEFT);
+  oled.setFont(ArialMT_Plain_10);
+  oled.clear();
+  oled.drawString(0, 0, "Awning");
   oled.display();
+  s_ok = true;
+#endif
 }
 
 static const char* stateName(AwningState s) {
@@ -30,53 +37,38 @@ static const char* stateName(AwningState s) {
 
 void displayRender() {
   if (!s_ok) return;
-  oled.clearDisplay();
-
-  // Header: name + connectivity indicators (FR-5.4)
-  oled.setTextSize(1);
-  oled.setCursor(0, 0);
-  oled.print(F("Awning"));
-  oled.setCursor(80, 0);
-  oled.print(netWifiConnected() ? F("wifi") : F("----"));
-  oled.setCursor(110, 0);
-  oled.print(netMqttConnected() ? F("mq") : F("--"));
-  oled.drawFastHLine(0, 10, OLED_W, SSD1306_WHITE);
+  oled.clear();
+  oled.setTextAlignment(TEXT_ALIGN_LEFT);
 
   AwningState st = motionState();
+  char buf[32];
 
   if (motionMoving()) {
-    // Progress bar + countdown to the counter-stop (FR-5.3)
-    oled.setTextSize(1);
-    oled.setCursor(0, 16);
-    oled.print(motionDir() == DIR_EXTEND ? F("EXTENDING") : F("RETRACTING"));
-    oled.setCursor(84, 16);
-    oled.printf("%.2fm", motionTargetM());
+    // State (16pt) + big progress bar + target (FR-5.3)
+    oled.setFont(ArialMT_Plain_16);
+    oled.drawString(0, 0, motionDir() == DIR_EXTEND ? "EXTENDING" : "RETRACTING");
     int w = (int)(motionProgress() * (OLED_W - 4));
-    oled.drawRect(0, 30, OLED_W, 12, SSD1306_WHITE);
-    oled.fillRect(2, 32, w, 8, SSD1306_WHITE);
-    oled.setCursor(0, 46);
-    oled.printf("stop at %.2f m", motionTargetM());
+    oled.drawRect(0, 24, OLED_W, 16);
+    oled.fillRect(2, 26, w, 12);
+    snprintf(buf, sizeof(buf), "-> %.2f m", motionTargetM());
+    oled.drawString(0, 44, buf);
   } else {
-    // Large centred state with a direction glyph (FR-5.2)
-    oled.setTextSize(1);
-    oled.setCursor(0, 20);
-    oled.print(st == ST_RETRACTED ? F("^") : F("v"));
-    oled.setTextSize(2);
-    oled.setCursor(14, 18);
-    oled.print(stateName(st));
-    oled.setTextSize(1);
-    oled.setCursor(0, 40);
-    oled.printf("pos %.2f m", motionPositionM());
-    if (motionSafetyRetract()) { oled.setCursor(84, 40); oled.print(F("SAFE")); }
+    // State (16pt) + large position readout (24pt) (FR-5.2)
+    oled.setFont(ArialMT_Plain_16);
+    oled.drawString(0, 0, motionSafetyRetract() ? "SAFE RETRACT" : stateName(st));
+    oled.setFont(ArialMT_Plain_24);
+    snprintf(buf, sizeof(buf), "%.2f m", motionPositionM());
+    oled.drawString(0, 22, buf);
   }
 
-  // Footer: IP (FR-5.4/5.5)
-  oled.drawFastHLine(0, 54, OLED_W, SSD1306_WHITE);
-  oled.setTextSize(1);
-  oled.setCursor(0, 56);
-  if (netPortalActive())      oled.print(F("AP: " AP_SSID));
-  else if (netWifiConnected()) oled.print(netIP());
-  else                         oled.print(F("WiFi..."));
+  // Footer: connectivity + IP / AP (FR-5.4/5.5)
+  oled.drawHorizontalLine(0, 52, OLED_W);
+  oled.setFont(ArialMT_Plain_10);
+  if (netPortalActive())       oled.drawString(0, 53, "AP:" AP_SSID);
+  else if (netWifiConnected()) oled.drawString(0, 53, netIP());
+  else                         oled.drawString(0, 53, "WiFi...");
+  oled.setTextAlignment(TEXT_ALIGN_RIGHT);
+  oled.drawString(OLED_W, 53, netMqttConnected() ? "MQ" : (netWifiConnected() ? "W" : ""));
 
   oled.display();
 }

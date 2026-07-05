@@ -18,6 +18,9 @@
 #define LED_PIN    25   // onboard LED mirrors carrier
 
 // ---- OLED (SSD1306 128x64, I2C) ----
+// Uses the ThingPulse SSD1306Wire driver with RST left undriven (per the
+// LILYGO V2.1_1.6.1 config in OpenMQTTGateway). Set to 0 to disable the panel.
+#define OLED_ENABLED 1
 #define OLED_SDA   21
 #define OLED_SCL   22
 #define OLED_RST   16
