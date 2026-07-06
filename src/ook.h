@@ -9,6 +9,12 @@ bool ookInit();
 // True once ookInit() has succeeded.
 bool ookReady();
 
+// Re-assert the OOK transmit configuration on the shared SX1278 and enter
+// continuous direct-transmit mode (DIO2 = OOK DATA output). Called before every
+// transmit burst because the RX gateway (rx433) reconfigures the same chip for
+// reception between bursts (FR-11 radio coexistence).
+void ookBeginTx();
+
 // Transmit BUTTONS[idx]'s codeword `transmissions` times; each transmission is
 // REPEATS words with the shared timing template, MSB-first (FR-1.2/1.4/1.5).
 void ookSend(uint8_t idx, uint8_t transmissions);

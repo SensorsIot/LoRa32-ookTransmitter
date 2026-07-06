@@ -4,6 +4,7 @@
 #include "motion.h"
 #include "display.h"
 #include "net.h"
+#include "rx433.h"
 
 // ============================================================
 // LoRa32 OOK Awning Controller
@@ -19,12 +20,14 @@ void setup() {
   delay(200);
   Serial.println(F("\nLoRa32 OOK Awning Controller"));
 
+  rx433EarlyInit(); // create the radio mutex before the TX task can key the radio (FR-11)
   if (!ookInit()) {
     Serial.println(F("Radio init failed - transmission disabled (FR-3.1)"));
   }
   displayInit();
   motionInit();     // starts the TX task and queues the boot full-retract (FR-4.10)
   netSetup();       // WiFi/provisioning/MQTT/HTTP/OTA (may block in the captive portal)
+  rx433Init();      // start the 433 MHz OOK RX gateway now the network is up (FR-11)
 
   Serial.println(F("Ready. Serial: u=up d=down a=auto m=manual"));
 }
@@ -44,6 +47,7 @@ static void serialPoll() {
 
 void loop() {
   netLoop();              // OTA, web, MQTT, periodic publish
+  rx433Loop();            // service the OOK RX gateway -> HA (FR-11)
   motionWatchdogTick();   // fail-closed on lost HA heartbeat (FR-4.6)
   serialPoll();           // FR-2.1
   static uint32_t lastOled = 0;

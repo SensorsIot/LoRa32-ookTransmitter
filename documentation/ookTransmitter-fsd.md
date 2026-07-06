@@ -42,8 +42,13 @@ control, OLED status, and the safety watchdog. Out of scope: signal capture/deco
 ### 2.1 Components
 
 - **MCU / Radio**: TTGO LoRa32 T3 v1.6.1 — ESP32 + Semtech SX1278 sub-GHz transceiver.
+  The one radio serves two roles: awning transmit (FR-1/FR-4) and a 433 MHz receive
+  gateway (FR-11), sharing it half-duplex.
 - **Display**: onboard SSD1306 128×64 OLED (I2C).
-- **Firmware**: PlatformIO / Arduino, RadioLib.
+- **Firmware**: PlatformIO / Arduino, RadioLib; the receive gateway uses the rtl_433_ESP
+  decoder engine.
+- **Receive gateway**: decodes 433.92 MHz OOK sensors (weather stations, the awning remote)
+  and republishes them to Home Assistant via MQTT auto-discovery (FR-11).
 - **Wind-safety controller (external)**: Home Assistant, using the site weather-station
   wind sensor, runs the awning automation and publishes the liveness heartbeat the device
   watches (FR-4.6). The device has no local wind sensor.
@@ -81,7 +86,8 @@ pulse train, and keys the SX1278 carrier via DIO2.
 | — | — | | **DIO2** | **32 — OOK keying** |
 
 OLED (SSD1306, I2C): SDA 21, SCL 22, reset GPIO 16. Onboard LED on GPIO 25 mirrors
-carrier state.
+carrier state. **DIO2 (GPIO 32) is bidirectional**: an output that keys the carrier when
+transmitting, and the OOK data input the receive gateway reads when receiving (FR-11).
 
 ### 2.5 Awning Motion Model
 
@@ -136,6 +142,26 @@ in-progress move; MQTT position commands run to completion.
   serial ┘                          ▲
   WiFi / MQTT / HTTP / OTA (other core)  stop / emergency preempts
 ```
+
+### 2.7 Receive Gateway Architecture
+
+The receive gateway holds the SX1278 in OOK receive continuously, decoding sensors with the
+rtl_433 engine, and republishes each packet to Home Assistant. Because the awning
+transmitter and the gateway share one radio, they are serialised by a **radio mutex**:
+
+```
+  433 MHz OOK ─RF─► SX1278 (RX) ─► rtl_433 decode ─► HA MQTT auto-discovery
+                        ▲
+                   radio mutex ──► a TX burst pauses RX, keys the awning, then resumes RX
+```
+
+- The gateway services decoding from the main loop (the same context as the MQTT client, so
+  publishing is single-threaded and safe).
+- Each awning transmit command takes the mutex, switches the radio to OOK transmit, keys the
+  codewords, then restores OOK receive and releases the mutex. Reception is deaf only for
+  the brief transmit, which occurs a few times per day.
+- Decoding is OOK-only — the modulation of the installed sensors — matching what a parallel
+  OpenMQTTGateway receives.
 
 ## 3. Requirements
 
@@ -253,6 +279,26 @@ in-progress move; MQTT position commands run to completion.
 - **FR-10.2** [Must]: Stop and emergency requests shall preempt an in-progress move; MQTT
   position commands shall execute as complete sequences.
 
+**FR-11 — 433 MHz Receive Gateway**
+
+- **FR-11.1** [Must]: The device shall receive 433.92 MHz OOK transmissions on the shared
+  SX1278 and decode them with the rtl_433 decoder engine (rtl_433_ESP), using the full OOK
+  decoder set.
+- **FR-11.2** [Must]: The device shall republish each decoded packet to Home Assistant via
+  MQTT auto-discovery — a retained discovery config per sensor field plus a state message on
+  `rtl_433/<model>/<id>` — reusing the awning MQTT connection.
+- **FR-11.3** [Must]: The receive gateway and the awning transmitter shall share the radio
+  half-duplex under a mutex: a transmit burst pauses reception for its duration and
+  reception resumes immediately after (§2.7).
+- **FR-11.4** [Should]: The device shall map common sensor fields to Home Assistant device
+  classes — temperature, humidity, battery, pressure, wind, rain, illuminance — and expose
+  other fields (including remote button/state/event) as plain sensors.
+- **FR-11.5** [Should]: The device shall decode the Euromot awning remote (the four
+  codewords under device id `0x7F4`) and publish the pressed button and raw code.
+- **FR-11.6** [Should]: The gateway shall operate OOK-only (the modulation of the installed
+  sensors); FSK sensors are out of scope.
+- **FR-11.7** [May]: The device shall report the count of decoded packets for diagnostics.
+
 ### 3.2 Non-Functional Requirements
 
 - **NFR-1** [Must]: Reproduced pulse widths shall fall within the target receiver's timing
@@ -273,18 +319,23 @@ in-progress move; MQTT position commands run to completion.
 | R-2 | Risk | Transmitting at close range overloads a nearby RTL-SDR. | Low TX power, distance, or attenuation (NFR-2). |
 | R-3 | Risk | Open-loop position drifts while extending. | Every full retract re-homes to 0 (FR-4.10). |
 | R-4 | Risk | A fast gust while HA is alive but slow to react leaves the awning exposed; no local sensor can beat HA's reaction. | Conservative wind threshold and prompt retract in the HA automation. |
+| R-5 | Risk | The gateway is deaf to sensors while the awning transmits. | TX bursts are short and infrequent (a few/day); RX resumes immediately (FR-11.3). |
 | A-1 | Assumption | The awning remote uses fixed (non-rolling) codes. | — |
 | A-2 | Assumption | Wind data exists only in Home Assistant; the device delegates wind safety to HA. | Heartbeat watchdog retracts on HA/automation/link loss (FR-4.6). |
 | D-1 | Dependency | RadioLib SX127x driver (OOK direct mode). | Pinned in `platformio.ini`. |
 | D-2 | Dependency | Home Assistant awning automation publishing `awning/watchdog`. | FR-4.6, §9.4. |
+| D-3 | Dependency | rtl_433_ESP decoder engine for the receive gateway. | Pinned in `platformio.ini`; RadioLib shared with TX (FR-11). |
 
 ## 5. Interfaces
 
 ### 5.1 RF Interface
 - Frequency: 433.92 MHz. Modulation: OOK, PWM-coded.
-- Timing template: long pulse ≈2150 µs / space ≈172 µs; short pulse ≈416 µs / space
-  ≈1908 µs; inter-word reset ≈15.6 ms.
-- Payload: 18-bit fixed codeword, MSB-first.
+- **Transmit** timing template: long pulse ≈2150 µs / space ≈172 µs; short pulse ≈416 µs /
+  space ≈1908 µs; inter-word reset ≈15.6 ms. Payload: 18-bit fixed codeword, MSB-first.
+- **Receive** (gateway, FR-11): OOK, full rtl_433 OOK decoder set, plus the Euromot awning
+  remote decoder (OOK-PWM, short 340 µs / long 2068 µs / reset 13936 µs, 18-bit codeword,
+  id `0x7F4`). Decoded packets are published under the MQTT topic `rtl_433/<model>/<id>`
+  with Home Assistant discovery under `homeassistant/`.
 
 ### 5.2 Serial Interface
 - 115200 baud, 8N1, USB CDC (CH9102).

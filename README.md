@@ -14,6 +14,12 @@ fail-closed wind-safety watchdog.
 - 🏠 **Home Assistant integration** via MQTT auto-discovery: the awning appears as a `cover`
   (open / close / stop / set-position), plus an emergency-retract button and diagnostic
   sensors.
+- 📡 **433 MHz receive gateway.** The *same* SX1278 also receives 433 OOK sensors (weather
+  stations, thermo-hygrometers, the Euromot remote) with the rtl_433 decoder engine and
+  republishes them to Home Assistant via MQTT auto-discovery — a drop-in replacement for
+  OpenMQTTGateway, sharing the radio half-duplex with the awning transmitter. See
+  [`documentation/rx-integration-plan.md`](documentation/rx-integration-plan.md) and
+  [`tools/`](tools/).
 - 📱 **Local web page** on the LAN with up / down / stop / emergency controls, a
   target-position input, live state and progress, and the auto / manual remote buttons.
 - 🛡️ **Fail-closed safety.** Home Assistant is the wind-safety authority: it publishes a

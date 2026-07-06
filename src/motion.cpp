@@ -1,5 +1,6 @@
 #include "motion.h"
 #include "ook.h"
+#include "rx433.h"
 
 // ---- Command queue ----
 enum CmdType { CMD_TARGET, CMD_STOP, CMD_EMERGENCY, CMD_RAW, CMD_BOOTHOME };
@@ -130,6 +131,12 @@ static void doEmergency(bool boot) {
 
 static void handleCommand(const Command& c) {
   s_abort = false;                          // start each queued command fresh
+
+  // STOP carries no transmission; every other command keys the radio, so take
+  // the radio away from the RX gateway for the whole command (FR-11 half-duplex).
+  bool transmits = (c.type != CMD_STOP);
+  if (transmits) rx433TxBegin();
+
   switch (c.type) {
     case CMD_BOOTHOME:  doEmergency(/*boot=*/true);  break;
     case CMD_EMERGENCY: doEmergency(/*boot=*/false); break;
@@ -140,6 +147,8 @@ static void handleCommand(const Command& c) {
       break;
     case CMD_STOP:      /* a running move already saw s_abort; nothing to do */ break;
   }
+
+  if (transmits) rx433TxEnd();
 }
 
 static void txTask(void*) {

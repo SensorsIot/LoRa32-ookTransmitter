@@ -324,6 +324,7 @@ void netLoop() {
 // ---------- Status getters ----------
 bool   netWifiConnected() { return WiFi.status() == WL_CONNECTED; }
 bool   netMqttConnected() { return mqtt.connected(); }
+PubSubClient& netMqttClient() { return mqtt; }
 bool   netPortalActive()  { return s_portalActive; }
 String netIP()            { return WiFi.localIP().toString(); }
 int    netRSSI()          { return WiFi.RSSI(); }

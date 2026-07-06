@@ -1,0 +1,12 @@
+{
+  "description": "Whitelist of rtl_433 (433 MHz) sensors that MUST survive Home Assistant MQTT cleanup. Everything else that is an rtl_433 device (MQTT device with no real manufacturer, i.e. '<unknown>') is treated as a false decode / stale ghost and removed by tools/ha_cleanup_rtl433.py. Devices that DO have a real manufacturer (Xiaomi, IKEA, TuYa, esphome, espressif, OMG_community, SensorsIot, ...) are never touched. Match is by exact HA device name (Model-<id>).",
+  "keep_names": [
+    "Acurite-609TXC-0",
+    "Bresser-3CH-2-186",
+    "Cotech-367959-37",
+    "Fineoffset-WHx080-0-169",
+    "LaCrosse-TX-118",
+    "Nexus-TH-1-31",
+    "inFactory-TH-1-163"
+  ]
+}

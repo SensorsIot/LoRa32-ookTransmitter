@@ -9,19 +9,12 @@ static inline void carrier(bool on) {
   digitalWrite(LED_PIN,   on ? HIGH : LOW);
 }
 
-bool ookInit() {
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
-
-  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
-
+// Assert OOK direct-transmit configuration on the chip. Split out of ookInit so
+// it can be re-run after the RX gateway has reconfigured the same SX1278 for
+// reception (the two share one radio; see rx433). Idempotent.
+void ookBeginTx() {
   // FSK engine with OOK modulation enabled.
-  int st = radio.beginFSK(FREQ_MHZ, 4.8, 5.0, 125.0, TX_POWER, 16, /*enableOOK=*/true);
-  if (st != RADIOLIB_ERR_NONE) {
-    Serial.printf("beginFSK failed: %d - check board variant / RST pin\n", st);
-    s_ready = false;
-    return false;
-  }
+  radio.beginFSK(FREQ_MHZ, 4.8, 5.0, 125.0, TX_POWER, 16, /*enableOOK=*/true);
   radio.setOOK(true);
   radio.setFrequency(FREQ_MHZ);
   radio.setOutputPower(TX_POWER);
@@ -31,6 +24,21 @@ bool ookInit() {
   pinMode(LORA_DIO2, OUTPUT);
   digitalWrite(LORA_DIO2, LOW);
   radio.transmitDirect();
+}
+
+bool ookInit() {
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
+
+  int st = radio.beginFSK(FREQ_MHZ, 4.8, 5.0, 125.0, TX_POWER, 16, /*enableOOK=*/true);
+  if (st != RADIOLIB_ERR_NONE) {
+    Serial.printf("beginFSK failed: %d - check board variant / RST pin\n", st);
+    s_ready = false;
+    return false;
+  }
+  ookBeginTx();
 
   s_ready = true;
   return true;

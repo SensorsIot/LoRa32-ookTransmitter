@@ -1,5 +1,6 @@
 #pragma once
 #include "config.h"
+#include <PubSubClient.h>
 
 // WiFi provisioning + MQTT/Home Assistant + HTTP + OTA (FR-6..FR-9).
 
@@ -18,3 +19,8 @@ bool        netPortalActive();
 String      netIP();
 int         netRSSI();
 String      netSSID();
+
+// Shared MQTT client, so the RX gateway (rx433) can publish decoded sensors and
+// their HA discovery configs on the same connection. Only use from the loop()
+// context (not the TX task).
+PubSubClient& netMqttClient();
