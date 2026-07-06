@@ -3,10 +3,16 @@
 Helpers for running the 433 MHz RX gateway (`src/rx433.*`) alongside / instead of
 OpenMQTTGateway (OMG) and keeping Home Assistant tidy.
 
+> **Note:** the gateway ships with MQTT auto-discovery **off** (`RX433_HA_DISCOVERY=0`),
+> so it does **not** create HA devices — it only publishes `rtl_433/<model>/<id>` state
+> topics for hand-configured `mqtt:` sensors (see the migration section below). In that
+> default mode noise-decodes never spawn HA devices, so this cleanup tool is **not needed**.
+> It is only relevant if you build with `RX433_HA_DISCOVERY=1`.
+
 ## Whitelist cleanup — `ha_cleanup_rtl433.py`
 
-The gateway (like OMG) runs the full rtl_433 OOK decoder set, which mis-reads RF
-noise as new "devices" (`Acurite-986-<random>`, `Oregon-CM180i-<random>`,
+With auto-discovery enabled, the gateway (like OMG) runs the full rtl_433 OOK decoder set,
+which mis-reads RF noise as new "devices" (`Acurite-986-<random>`, `Oregon-CM180i-<random>`,
 `Markisol`, `Secplus-v1`, `Generic-Motion/Remote`, …). Each spawns an MQTT device
 card in HA that lingers even after its entities disappear.
 

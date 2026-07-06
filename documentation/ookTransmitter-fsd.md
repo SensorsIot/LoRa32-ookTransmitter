@@ -284,9 +284,13 @@ transmitter and the gateway share one radio, they are serialised by a **radio mu
 - **FR-11.1** [Must]: The device shall receive 433.92 MHz OOK transmissions on the shared
   SX1278 and decode them with the rtl_433 decoder engine (rtl_433_ESP), using the full OOK
   decoder set.
-- **FR-11.2** [Must]: The device shall republish each decoded packet to Home Assistant via
-  MQTT auto-discovery — a retained discovery config per sensor field plus a state message on
-  `rtl_433/<model>/<id>` — reusing the awning MQTT connection.
+- **FR-11.2** [Must]: The device shall republish each decoded packet as an MQTT state
+  message on `rtl_433/<model>/<id>` (reusing the awning MQTT connection), to be consumed by
+  hand-configured Home Assistant `mqtt:` sensors.
+- **FR-11.2a** [May]: The device may additionally emit Home Assistant MQTT auto-discovery
+  (a retained config per field), behind the `RX433_HA_DISCOVERY` build flag. Disabled by
+  default: with the full decoder set every noise-decode would spawn an HA device, so
+  state-topics + curated `mqtt:` sensors is the default, clean configuration.
 - **FR-11.3** [Must]: The receive gateway and the awning transmitter shall share the radio
   half-duplex under a mutex: a transmit burst pauses reception for its duration and
   reception resumes immediately after (§2.7).

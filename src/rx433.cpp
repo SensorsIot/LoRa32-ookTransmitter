@@ -11,6 +11,15 @@
 // 433 MHz OOK RX gateway + generic rtl_433 -> Home Assistant bridge (FR-11)
 // ============================================================
 
+// Auto-discovery: 0 = publish only the rtl_433/<model>/<id> state topics (read
+// them with hand-configured `mqtt:` sensors in HA); 1 = also emit HA MQTT
+// auto-discovery. Discovery is OFF by default: with the full decoder set every
+// noise-decode spawns an HA device, so state-topics + curated YAML sensors is
+// the clean setup.
+#ifndef RX433_HA_DISCOVERY
+#define RX433_HA_DISCOVERY 0
+#endif
+
 // rtl_433 internals for injecting the project-local Euromot decoder at runtime
 // (see euromot_awning.c). Minimal forward declarations avoid pulling the heavy
 // rtl_433 headers into this Arduino translation unit; we only take addresses.
@@ -25,6 +34,8 @@ static char           s_msg[512];                 // rtl_433 JSON callback buffe
 static SemaphoreHandle_t s_mutex = nullptr;       // guards the shared SX1278
 static volatile bool  s_rxActive = false;
 static uint32_t       s_count    = 0;
+
+#if RX433_HA_DISCOVERY
 static std::set<String> s_seen;                   // "<device>/<field>" discovery published
 
 // ---- Field -> Home Assistant mapping ----
@@ -64,6 +75,7 @@ static const char* const STRING_FIELDS[][2] = {
   { "state",  "State" },
   { "event",  "Event" },
 };
+#endif  // RX433_HA_DISCOVERY (field tables)
 
 // Restrict an id to characters HA accepts in object/node ids.
 static String sanitize(const String& in) {
@@ -76,6 +88,7 @@ static String sanitize(const String& in) {
   return out;
 }
 
+#if RX433_HA_DISCOVERY
 // Publish one HA discovery config (retained), once per (device, field).
 static void publishDiscovery(const String& comp, const String& dev,
                              const String& devName, const String& model,
@@ -115,6 +128,7 @@ static void publishDiscovery(const String& comp, const String& dev,
   if (mqtt.publish(topic, (const uint8_t*)buf, n, /*retained=*/true))
     s_seen.insert(seenKey);
 }
+#endif  // RX433_HA_DISCOVERY (publishDiscovery)
 
 // rtl_433 decode callback. Runs in the loop() context that calls rf.loop()
 // (rx433Loop), i.e. the same task as the MQTT client, so publishing here is
@@ -138,13 +152,16 @@ static void onMessage(char* json) {
   if (!netMqttConnected()) return;
   PubSubClient& mqtt = netMqttClient();
 
-  String dev       = sanitize(String(model) + "-" + idStr);
-  String devName   = String(model) + " " + idStr;
   String stateTopic = "rtl_433/" + sanitize(model) + "/" + sanitize(idStr);
 
   // State (not retained): sensors refresh on their next packet, and this avoids
   // replaying one-shot events (e.g. a remote button press) on an HA restart.
+  // Read these with hand-configured `mqtt:` sensors in HA.
   mqtt.publish(stateTopic.c_str(), (const uint8_t*)json, strlen(json), false);
+
+#if RX433_HA_DISCOVERY
+  String dev     = sanitize(String(model) + "-" + idStr);
+  String devName = String(model) + " " + idStr;
 
   // Discovery for each mapped field present.
   for (const auto& f : FIELDS) {
@@ -170,6 +187,7 @@ static void onMessage(char* json) {
                      nullptr, nullptr,
                      "{{ 'OFF' if value_json.battery_ok == 1 else 'ON' }}");
   }
+#endif  // RX433_HA_DISCOVERY
 
   s_count++;
 }
